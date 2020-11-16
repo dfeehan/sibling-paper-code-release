@@ -1,0 +1,904 @@
+---
+title: "Malawi 2000 DHS sibling history analysis"
+output: html_notebook
+---
+
+## Analyze the Malawi 2000 sibling histories as an illustration of our methods
+
+```{r}
+library(tidyverse)
+library(siblingsurvival)
+library(rdhs)
+library(tictoc)
+library(lubridate)
+library(glue)
+library(here)
+library(latex2exp)
+library(kableExtra)
+```
+
+Load the data prepped in `01_get_data.Rmd`
+
+```{r}
+load(file=here('data', 'malawi_dhs_2000.RData'))
+```
+
+Create an object that describes the cells we'd like to use for the estimates
+
+```{r}
+cc <- cell_config(age.groups='5yr_to50', 
+                  time.periods='7yr_beforeinterview',
+                  start.obs='sib.dob',    # date of birth
+                  end.obs='sib.endobs',   # either the date respondent was interviewed (if sib is alive) or date of death (if sib is dead)
+                  event='sib.death.date', # date of death (for sibs who died)
+                  age.offset='sib.dob',   # date of birth
+                  time.offset='doi',      # date of interview
+                  exp.scale=1/12)
+```
+
+
+### Estimating death rates
+
+Given these preparatory steps, the `sibling_estimator` function will take care of estimating
+death rates from the sibling histories for us.
+
+```{r}
+ex_ests <- sibling_estimator(sib.dat = mw.sib,
+                             ego.id = 'caseid',            # column with the respondent id
+                             sib.id = 'sibid',             # column with sibling id 
+                                                           # (unique for each reported sibling)
+                             sib.frame.indicator = 'in.F', # indicator for sibling frame population membership
+                             sib.sex = 'sib.sex',          # column with sibling's sex
+                             cell.config=cc,               # cell configuration we created above
+                             weights='wwgt')               # column with the respondents' sampling weights
+
+names(ex_ests)
+```
+
+`sibling_estimator` returns a list with the results. We'll focus on `asdr.ind`, which has the individual visibility
+estimates, and `asdr.agg`, which has the aggregate visibility estimates.
+
+Here are the individual visibility estimates:
+
+```{r}
+ex_ests$asdr.ind
+```
+
+And here are the aggregate visibility estimates
+
+```{r}
+ex_ests$asdr.agg
+```
+
+### Plotting the results
+
+We'll make some plots showing the results
+
+
+```{r}
+fig.height <- 4
+fig.width <- 5
+
+ind.ests <- ggplot(ex_ests$asdr.ind) +
+  geom_line(aes(x=sib.age, y=1000*asdr.hat, color=sib.sex, group=sib.sex)) +
+  theme_minimal() +
+  scale_y_log10() + 
+  ggtitle('individual visibility estimator, 7yr before survey')
+
+ggsave(filename=here('out', 'mw2000-ind-ests.pdf'),
+       plot=ind.ests,
+       height=fig.height, width=fig.width)
+
+ind.ests
+```
+
+
+```{r}
+fig.height <- 4
+fig.width <- 5
+
+agg.ests <- ggplot(ex_ests$asdr.agg) +
+  geom_line(aes(x=sib.age, y=1000*asdr.hat, color=sib.sex, group=sib.sex)) +
+  theme_minimal() +
+  scale_y_log10() + 
+  ggtitle('aggregate visibility estimator, 7yr before survey')
+
+ggsave(filename=here('out', 'mw2000-agg-ests.pdf'),
+       plot=agg.ests,
+       height=fig.height, width=fig.width)
+
+agg.ests
+```
+
+```{r}
+fig.height <- 4
+fig.width <- 8
+
+compare <- bind_rows(ex_ests$asdr.ind, 
+                     ex_ests$asdr.agg) %>%
+  ungroup() %>%
+  mutate(sib.sex = dplyr::recode(sib.sex,
+                                 `m` = "Males",
+                                 `f` = "Females"),
+         sib.agelab = stringr::str_sub(sib.age,2,3),
+         estimator = dplyr::recode(estimator,
+                                   `sib_agg`='Aggregate visibility',
+                                   `sib_ind`='Individual visibility'))
+
+
+comp.plot <- ggplot(compare) +
+  geom_line(aes(x=sib.agelab, 
+                y=1000*asdr.hat, 
+                color=estimator, 
+                group=estimator)) +
+  theme_minimal() +
+  facet_grid(. ~ sib.sex) +
+  theme_minimal() +
+  scale_color_viridis_d() +
+  scale_y_log10() + 
+  ylab(TeX('$\\widehat{M}^V_{\\alpha} \\times 1,000$')) +
+  xlab("") +
+  theme(legend.position="bottom")
+  #scale_y_log10() + 
+  #ggtitle('both estimators, 7yr before survey')
+
+ggsave(filename=here('out', 'mw2000-comp-ests.pdf'),
+       plot=comp.plot,
+       height=fig.height, width=fig.width)
+
+comp.plot
+```
+
+
+## Variance estimates
+
+In practice, we want point estimates and estimated sampling uncertainty for the death rates.
+We'll use the rescaled bootstrap to estimate sampling uncertainty. This can be done with the `surveybootstrap` package.
+
+Before we use the rescaled bootstrap, we need to know a little bit about the sampling design of the survey
+we're working with.
+In this example dataset, we have a stratified, multistage design. So we'll need to tell the bootstrap function about
+the strata and the primary sampling units. In this example data, these are indicated by the 'stratum' and 'psu'
+columns of the dataset.
+
+(NOTE: this takes about a minute or so on a 2018 MBP for 1000 resamples.)
+
+```{r}
+set.seed(101010)
+
+tic('running bootstrap')
+## this will take a little while -- for 1000 reps, it takes about 1 minutes on a 2018 Macbook Pro
+num.boot.reps <- 1000
+bootweights <- surveybootstrap::rescaled.bootstrap.weights(survey.design = ~ psu + 
+                                                                            stratum(stratum_analysis),
+                                                           # a high number is good here, though that will obviously
+                                                           # make everything take longer
+                                                           num.reps=num.boot.reps,
+                                                           idvar='caseid',       # column with the respondent ids
+                                                           weights='wwgt', # column with the sampling weight
+                                                           survey.data=mw.ego    # note that we pass in the respondent data, NOT the sibling data
+                                                           )
+toc()
+```
+
+
+The result, `bootweights`, is a dataframe that has a row for each survey respondent, a column for the survey respondent's ID,
+and then `num.boot.reps` columns containing survey weights that result from the bootstrap procedure.
+The basic idea is to calculate estimated death rates using each one of the `num.boot.reps` sets of weights.
+The variation across the estimates is then an estimator for the sampling variation.
+
+To make this easier, the `sibling_estimator` function can take a dataset with bootstrap resampled weights; it will
+then calculate and summarize the estimates for you.
+
+(NOTE: this takes about 3 minutes or so on a 2018 MBP when `bootweights` has 1000 resamples.)
+
+```{r}
+# to save time, we'll only use a subset of the bootstrap replicates
+
+short.bootweights <- bootweights %>% select(1:11)
+# toggle between short bootweights (faster, for coding) and long bootweights (for realism)
+#ests.bootweights <- short.bootweights
+ests.bootweights <- bootweights
+
+tic('calculating estimates with bootstrap')
+mw_boot_ests <- sibling_estimator(sib.dat = mw.sib,
+                                  ego.id = 'caseid',
+                                  sib.id = 'sibid',
+                                  sib.frame.indicator = 'in.F',
+                                  sib.sex = 'sib.sex',
+                                  cell.config=cc,
+                                  boot.weights=ests.bootweights,  # to get sampling uncertainty, we pass boot.weights into sibling_estimator
+                                  return.boot=TRUE,                # when TRUE, return all of the resampled estimates (not just summaries)
+                                  weights='wwgt')
+toc()
+```
+
+
+Finally, let's plot the estimated death rates along with their sampling uncertainty:
+
+```{r}
+fig.height <- 4
+fig.width <- 5
+
+ind.ests.withci <- ggplot(mw_boot_ests$asdr.ind) +
+  geom_ribbon(aes(x=sib.age, ymin=1000*asdr.hat.ci.low, ymax=1000*asdr.hat.ci.high, fill=sib.sex, group=sib.sex), alpha=.2) +
+  geom_line(aes(x=sib.age, y=1000*asdr.hat, color=sib.sex, group=sib.sex)) +
+  theme_minimal() +
+  scale_y_log10() + 
+  ggtitle('individual visibility estimator, 7yr before survey')
+
+ggsave(filename=here('out', 'mw2000-ind-ests-withci.pdf'),
+       plot=ind.ests.withci,
+       height=fig.height, width=fig.width)
+
+ind.ests.withci
+```
+
+
+
+```{r}
+fig.height <- 4
+fig.width <- 5
+
+agg.ests.withci <- ggplot(mw_boot_ests$asdr.agg) +
+  geom_ribbon(aes(x=sib.age, ymin=1000*asdr.hat.ci.low, ymax=1000*asdr.hat.ci.high, fill=sib.sex, group=sib.sex), alpha=.2) +
+  geom_line(aes(x=sib.age, y=1000*asdr.hat, color=sib.sex, group=sib.sex)) +
+  theme_minimal() +
+  scale_y_log10() + 
+  ggtitle('aggregate visibility estimator, 7yr before survey')
+
+ggsave(filename=here('out', 'mw2000-agg-ests-withci.pdf'),
+       plot=agg.ests.withci,
+       height=fig.height, width=fig.width)
+
+agg.ests.withci
+```
+
+Figure comparing male to male and female to female estimates
+
+```{r}
+fig.height <- 4
+fig.width <- 8
+
+comp.withci <- bind_rows(mw_boot_ests$asdr.agg,
+                         mw_boot_ests$asdr.ind) %>%
+  ungroup() %>%
+  mutate(sib.sex = dplyr::recode(sib.sex,
+                                 `m` = "Males",
+                                 `f` = "Females"),
+         sib.agelab = stringr::str_sub(sib.age,2,3),
+         estimator = dplyr::recode(estimator,
+                                   `sib_agg`='Aggregate visibility',
+                                   `sib_ind`='Individual visibility'))
+
+comp.ests.withci <- ggplot(comp.withci) +
+  geom_ribbon(aes(x=sib.agelab, 
+                  ymin=1000*asdr.hat.ci.low, 
+                  ymax=1000*asdr.hat.ci.high, 
+                  fill=estimator, 
+                  group=estimator), 
+              alpha=.2) +
+  geom_line(aes(x=sib.agelab, 
+                y=1000*asdr.hat, 
+                color=estimator, 
+                group=estimator)) +
+  facet_grid(. ~ sib.sex) +
+  theme_minimal() +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  scale_y_log10() + 
+  ylab(TeX('$\\widehat{M}^V_{\\alpha} \\times 1,000$')) +
+  xlab("") +
+  theme(legend.position="bottom")
+  #ggtitle('sibling history estimators, 7yr before survey')
+
+ggsave(filename=here('out', 'mw2000-comp-ests-withci.pdf'),
+       plot=comp.ests.withci,
+       height=fig.height, width=fig.width)
+
+comp.ests.withci
+```
+
+Calculate some summaries about sampling error across the two estimators
+
+```{r}
+comp.ci <- bind_rows(mw_boot_ests$asdr.ind, mw_boot_ests$asdr.agg)
+
+comp.ci <- comp.ci %>%
+  # calculate the relative standard error
+  mutate(rel.se = asdr.hat.se / asdr.hat) %>%
+  group_by(estimator) %>%
+  # take the average
+  summarize(mean.rel.se = mean(rel.se),
+            gmean.rel.se = exp(mean(log(rel.se))))
+
+comp.ci.fortab <-
+  comp.ci %>%
+  select(estimator, mean.rel.se) %>%
+  mutate(estimator = dplyr::recode(estimator,
+                                   `sib_agg`="Aggregate visibility",
+                                   `sib_ind`="Individual visibility"))
+
+comp.ci.tab <- knitr::kable(comp.ci.fortab,
+             format='latex',
+             booktabs=T,
+             label="ci-compare",
+             col.names=c("Estimator", "Estimated Avg. Relative Std. Error"),
+             escape=FALSE,
+             format.args=list(digits=2),
+             caption="Comparison in average relative standard error for aggregate and individual visibility estimates of death rates across all ages and sexes.")
+
+cat(comp.ci.tab, 
+    file=here('out', "mw-compare-ci.tex"))
+```
+
+Now repeat the summaries, breaking them down by sex.
+
+```{r}
+comp.ci.bysex <- bind_rows(mw_boot_ests$asdr.ind, mw_boot_ests$asdr.agg)
+
+comp.ci.bysex <- comp.ci.bysex %>%
+  # calculate the relative standard error
+  mutate(rel.se = asdr.hat.se / asdr.hat) %>%
+  group_by(estimator, sib.sex) %>%
+  # take the average
+  summarize(mean.rel.se = mean(rel.se),
+            gmean.rel.se = exp(mean(log(rel.se))))
+
+comp.ci.bysex.fortab <-
+  comp.ci.bysex %>%
+  ungroup() %>%
+  select(estimator, sib.sex, mean.rel.se) %>%
+  spread(sib.sex, mean.rel.se)   %>%
+  mutate(estimator = dplyr::recode(estimator,
+                                   `sib_agg`="Aggregate visibility",
+                                   `sib_ind`="Individual visibility")) %>%
+  ## be sure the order is fixed, so columns are right
+  select(estimator, f, m)
+
+comp.ci.bysex.tab <- knitr::kable(comp.ci.bysex.fortab,
+             format='latex',
+             booktabs=T,
+             label="ci-compare-bysex",
+             col.names=kableExtra::linebreak(c("Estimator", "Females",  "Males")),
+             escape=FALSE,
+             format.args=list(digits=2),
+             caption="Comparison in average relative standard error for aggregate and individual visibility estimates of death rates across all ages for males and for females.") %>%
+             add_header_above(c("", "Estimated Average\nRelative Standard Error"=2))
+
+cat(comp.ci.bysex.tab, 
+    file=here('out', "mw-compare-ci-bysex.tex"))
+```
+
+## Internal consistency checks
+
+In this section, we illustrate how to conduct internal consistency checks
+
+
+```{r}
+# to produce single year of age IC checks, we need to set
+# age.groups to '1yr'
+# time.periods to '12mo_beforeinterview'
+cc_sya <- cell_config(age.groups='1yr_to50', 
+                      time.periods='12mo_beforeinterview',
+                      start.obs='sib.dob',    # date of birth
+                      end.obs='sib.endobs',   # either the date respondent was interviewed (if sib is alive) or date of death (if sib is dead)
+                      event='sib.death.date', # date of death (for sibs who died)
+                      age.offset='sib.dob',   # date of birth
+                      time.offset='doi',      # date of interview
+                      exp.scale=1/12)
+```
+
+
+This next chunk takes longer to run, about 15 minutes on a 2018 MBP.
+
+```{r}
+short.bootweights <- bootweights %>% select(1:11)
+
+# toggle between short bootweights (faster, for coding) and long bootweights (for realism)
+#ests.bootweights <- short.bootweights
+ests.bootweights <- bootweights
+
+tic('calculating estimates with bootstrap')
+mw_boot_sya_ests <- sibling_estimator(sib.dat = mw.sib,
+                                      ego.id = 'caseid',
+                                      sib.id = 'sibid',
+                                      sib.frame.indicator = 'in.F',
+                                      sib.sex = 'sib.sex',
+                                      cell.config=cc_sya,
+                                      boot.weights=ests.bootweights,  # to get sampling uncertainty, we pass boot.weights into sibling_estimator
+                                      return.boot=TRUE,                # when TRUE, return all of the resampled estimates (not just summaries)
+                                      weights='wwgt')
+toc()
+```
+
+```{r}
+mw_boot_sya_ests$esc.dat <- mw_boot_sya_ests$esc.dat %>%
+  mutate(sib.sya = as.numeric(str_sub(sib.age, 2, 3)))
+
+# toggle between short bootweights (faster, for coding) 
+# and long bootweights (for realism)
+#ic.sya.bootweights <- short.bootweights
+ic.sya.bootweights <- bootweights
+
+tic("Internal consistency checks - single year of age")
+ic.checks.sya <- sib_ic_checks(mw_boot_sya_ests$esc.dat,
+                               ego.dat=mw.ego,
+                               ego.id='caseid',
+                               sib.id='sibid',
+                               sib.frame.indicator='in.F',
+                               ## we're doing single year of age here
+                               #sib.cell.vars=c('sib.age', 'sib.sex'),
+                               sib.cell.vars=c('sib.sya', 'sib.sex'),
+                               ego.cell.vars=c('age', 'sex'),
+                               boot.weights=ic.sya.bootweights)
+toc()
+
+names(ic.checks.sya)
+```
+
+
+```{r}
+fig.height <- 4
+fig.width <- 7
+
+ic.sya.plot <- ggplot(ic.checks.sya$ic.summ) +
+  geom_hline(yintercept=0) +
+  geom_pointrange(aes(x=age,
+                      y=diff_mean,
+                      ymin=diff_ci_low,
+                      ymax=diff_ci_high)) +
+  theme_minimal() +
+  #ggtitle("Internal consistency checks") +
+  xlab("") +
+  ylab(expression(Delta[alpha]))
+
+ggsave(filename=here('out', 'mw2000-ic-sya.pdf'),
+       plot=ic.sya.plot,
+       height=fig.height, width=fig.width)
+
+ic.sya.plot
+```
+
+```{r}
+fig.height <- 4
+fig.width <- 5
+
+ic.sya.plot.smooth <- ggplot(ic.checks.sya$ic.summ %>% 
+                               mutate(age = as.numeric(age))) +
+  geom_hline(yintercept=0) +
+  geom_point(aes(x=age,
+                 y=diff_mean)) +
+  geom_pointrange(aes(x=age,
+                      y=diff_mean,
+                      ymin=diff_ci_low,
+                      ymax=diff_ci_high)) +
+  geom_smooth(aes(x=age, y=diff_mean), color='blue') +
+  theme_minimal() +
+  ggtitle("Internal consistency checks") +
+  xlab("Age") +
+  ylab(expression(Delta[alpha]))
+
+ggsave(filename=here('out', 'mw2000-ic-sya-withsmooth.pdf'),
+       plot=ic.sya.plot.smooth,
+       height=fig.height, width=fig.width)
+
+ic.sya.plot.smooth
+```
+
+
+## Visibilities
+
+```{r}
+sib.F.dat <- mw.sib %>%
+  group_by(caseid) %>%
+  summarize(y.F = sum(in.F),
+            sib.size = n() + 1)
+
+ego.vis <- mw.ego %>% 
+  select(caseid, wwgt, age.cat, sex) %>%
+  left_join(sib.F.dat, by='caseid')
+
+# if nothing was joined in, there are no sibs
+ego.vis <- ego.vis %>%
+  mutate(y.F=ifelse(is.na(y.F), 0, y.F),
+         y.Fplusone = y.F + 1,
+         sib.size = ifelse(is.na(sib.size), 1, sib.size))
+
+# weighted harmonic mean
+wh.mean <- function(x, w) {
+  return(sum(w) / sum(w/x))
+}
+
+S.hat <- wh.mean(ego.vis$y.Fplusone, ego.vis$wwgt)
+S.adj.factor <- 1 - (1/S.hat)
+  
+y.F.bar <- weighted.mean(ego.vis$y.F, ego.vis$wwgt)
+approx.S.hat <- y.F.bar + 1
+approx.S.adj.factor <- 1 - (1/approx.S.hat)
+
+ego.vis.agg <- ego.vis %>%
+  mutate(age.cat = paste(age.cat)) %>%
+  group_by(sex, age.cat) %>%
+  summarise(y.F.bar = weighted.mean(y.F, wwgt)) %>%
+  mutate(adj.factor = S.adj.factor,
+         # this is the all-ages approximation
+         adj.factor.approx1 = approx.S.adj.factor,
+         # this is the age-specific approximation
+         adj.factor.approx2 = y.F.bar / (y.F.bar + 1))
+
+```
+
+Plot fraction of egos with zero visibility
+
+```{r}
+ego.vis.toplot <-
+  ego.vis %>%
+  mutate(is_invisible = as.numeric(y.F == 0)) %>%
+  group_by(sex, age.cat) %>%
+  summarize(frac_invisible = sum(is_invisible * wwgt) / sum(wwgt))
+```
+
+```{r}
+fig.height <- 4
+fig.width <- 4
+
+ego.invis.plot <- ggplot(ego.vis.toplot %>%
+                           mutate(age.lab = str_sub(age.cat, 2, 3))) +
+  geom_point(aes(x = age.lab,
+                 y = frac_invisible)) +
+  expand_limits(y=0) +
+  scale_y_continuous(labels=scales::percent) +
+  theme_minimal() +
+  xlab("Age group") +
+  ylab("Estimated % of respondents\nwith zero visibility\n(Malawi 2000 DHS)")
+
+ggsave(filename=here('out', 'mw2000-invis-est.pdf'),
+       plot=ego.invis.plot,
+       height=fig.height, width=fig.width)
+
+ego.invis.plot
+```
+
+
+Make adjusted individual estimates
+
+```{r}
+for.adj.agg <- ex_ests$asdr.agg %>%
+  left_join(ego.vis.agg,
+            by=c('sib.sex'='sex', 'sib.age'='age.cat')) %>%
+  mutate(adj.factor = ifelse(is.na(adj.factor), 1, adj.factor),
+         adj.factor.approx1 = ifelse(is.na(adj.factor.approx1), 1, adj.factor.approx1),
+         adj.factor.approx2 = ifelse(is.na(adj.factor.approx2), 1, adj.factor.approx2))
+
+adj.agg.ests <- for.adj.agg %>% 
+  mutate(estimator = 'sib_agg_nocovar_adj',
+         asdr.hat = asdr.hat * adj.factor)
+
+adj.agg.ests.approx1 <- for.adj.agg %>% 
+  mutate(estimator = 'sib_agg_approx1_adj',
+         asdr.hat = asdr.hat * adj.factor.approx1)
+
+adj.agg.ests.approx2 <- for.adj.agg %>% 
+  mutate(estimator = 'sib_agg_approx2_adj',
+         asdr.hat = asdr.hat * adj.factor.approx2)
+
+```
+
+And plot a comparison (for the appendix, with all versions)
+
+```{r}
+fig.height <- 6
+fig.width <- 7
+
+compare <- bind_rows(ex_ests$asdr.ind, 
+                     ex_ests$asdr.agg, 
+                     #adj.agg.ests,
+                     adj.agg.ests.approx1,
+                     adj.agg.ests.approx2) %>%
+  ungroup() %>%
+  mutate(sib.sex = dplyr::recode(sib.sex,
+                                 `m` = "Males",
+                                 `f` = "Females"),
+         sib.agelab = stringr::str_sub(sib.age,2,3),
+         estimator = dplyr::recode(estimator,
+                                   `sib_agg`='Aggregate',
+                                   #`sib_agg_nocovar_adj`='Aggregate, adjusted (no covariance)',
+                                   `sib_agg_approx1_adj`='Aggregate, adjusted\n(all age approximation)',
+                                   `sib_agg_approx2_adj`='Aggregate, adjusted\n(age-specific approximation)',
+                                   `sib_ind`='Individual'))
+
+compare.plot <- ggplot(compare) +
+  geom_line(aes(x=sib.agelab, 
+                y=1000*asdr.hat, 
+                #color=sib.sex, 
+                #color=adjusted, 
+                color=estimator, 
+                group=interaction(estimator, sib.sex))) +
+  theme_minimal() +
+  #facet_grid(sex ~ .) +
+  xlab("") +
+  ylab(TeX('$\\widehat{M}^V_{\\alpha} \\times 1,000$')) +
+  facet_grid(. ~ sib.sex) +
+  #scale_linetype_manual(values=c('Aggregate'='solid',
+  #                               'Aggregate, adjusted'='dashed',
+  #                               'Individual'='dotted'),
+  #                      name='Estimator') +
+  scale_y_log10() +
+  guides(color=guide_legend(direction='vertical')) +
+  theme(legend.position="bottom")
+  #ggtitle('sibling estimators, 7yr before survey')
+
+ggsave(filename=here('out', 'mw2000-adj-agg-vis-all.pdf'),
+       plot=compare.plot,
+       height=fig.height, width=fig.width)
+
+compare.plot
+```
+
+And also plot a comparison with only one version, for the main paper
+
+```{r}
+fig.height <- 4
+fig.width <- 7
+
+compare <- bind_rows(ex_ests$asdr.ind, 
+                     ex_ests$asdr.agg, 
+                     #adj.agg.ests) %>%
+                     adj.agg.ests.approx1) %>%
+                     #adj.agg.ests.approx2) %>%
+  ungroup() %>%
+  mutate(sib.sex = dplyr::recode(sib.sex,
+                                 `m` = "Males",
+                                 `f` = "Females"),
+         sib.agelab = stringr::str_sub(sib.age,2,3),
+         estimator = dplyr::recode(estimator,
+                                   `sib_agg`='Aggregate',
+                                   #`sib_agg_nocovar_adj`='Aggregate, adjusted (no covariance)',
+                                   `sib_agg_approx1_adj`='Aggregate, adjusted\n(approximation)',
+                                   #`sib_agg_approx2_adj`='Aggregate, adjusted (age-specific approximation)',
+                                   `sib_ind`='Individual'))
+
+compare.plot <- ggplot(compare) +
+  geom_line(aes(x=sib.agelab, 
+                y=1000*asdr.hat, 
+                #color=sib.sex, 
+                #color=adjusted, 
+                linetype=estimator, 
+                group=interaction(estimator, sib.sex))) +
+  theme_minimal() +
+  #facet_grid(sex ~ .) +
+  xlab("") +
+  ylab(TeX('$\\widehat{M}^V_{\\alpha} \\times 1,000$')) +
+  facet_grid(. ~ sib.sex) +
+  scale_linetype_manual(values=c('Aggregate'='solid',
+                                 #'Aggregate, adjusted (no covariance)'='dashed',
+                                 'Aggregate, adjusted\n(approximation)'='dashed',
+                                 #'Aggregate, adjusted (age-specific approximation)'='dashed',
+                                 'Individual'='dotted'),
+                        name='Estimator:') +
+  scale_y_log10() +
+  #guides(linetype=guide_legend(direction='vertical')) +
+  theme(legend.position="bottom")
+  #ggtitle('sibling estimators, 7yr before survey')
+
+ggsave(filename=here('out', 'mw2000-adj-agg-vis.pdf'),
+       plot=compare.plot,
+       height=fig.height, width=fig.width)
+
+compare.plot
+```
+
+## Estimates 1 year before survey
+
+```{r}
+cc_12mo <- cell_config(age.groups='5yr_to50',
+                       time.periods='12mo_beforeinterview',
+                       #time.periods='7yr_beforeinterview',
+                       start.obs='sib.dob',    # date of birth
+                       end.obs='sib.endobs',   # either the date respondent was interviewed 
+                                               # (if sib is alive) or date of death (if sib is dead)
+                       event='sib.death.date', # date of death (for sibs who died)
+                       age.offset='sib.dob',   # date of birth
+                       time.offset='doi',      # date of interview
+                       exp.scale=1/12)
+```
+
+
+Given these preparatory steps, the `sibling_estimator` function will take care of estimating
+death rates from the sibling histories for us.
+
+```{r}
+tic('Estimates 1 yr before survey')
+mw_ests_12mo <- sibling_estimator(sib.dat = mw.sib,
+                                  ego.id = 'caseid',            # column with the respondent id
+                                  sib.id = 'sibid',             # column with sibling id 
+                                                                # (unique for each reported sibling)
+                                  sib.frame.indicator = 'in.F', # indicator for sibling frame population membership
+                                  sib.sex = 'sib.sex',          # column with sibling's sex
+                                  cell.config=cc_12mo,          # cell configuration we created above
+                                  boot.weights=ests.bootweights,# to get sampling uncertainty, we pass boot.weights into sibling_estimator
+                                  return.boot=TRUE,             # when TRUE, return all of the resampled estimates (not just summaries)
+                                  weights='wwgt')               # column with the respondents' sampling weights
+toc()
+
+names(mw_ests_12mo)
+```
+
+```{r}
+fig.height <- 4
+fig.width <- 8
+
+comp.withci.12mo <- bind_rows(mw_ests_12mo$asdr.agg,
+                              mw_ests_12mo$asdr.ind) %>%
+  ungroup() %>%
+  mutate(sib.sex = dplyr::recode(sib.sex,
+                                 `m` = "Males",
+                                 `f` = "Females"),
+         sib.agelab = stringr::str_sub(sib.age,2,3),
+         estimator = dplyr::recode(estimator,
+                                   `sib_agg`='Aggregate visibility',
+                                   `sib_ind`='Individual visibility'))
+
+comp.withci.12mo <- ggplot(comp.withci.12mo) +
+  geom_ribbon(aes(x=sib.agelab, 
+                  ymin=1000*asdr.hat.ci.low, 
+                  ymax=1000*asdr.hat.ci.high, 
+                  fill=estimator, 
+                  group=estimator), 
+              alpha=.2) +
+  geom_line(aes(x=sib.agelab, 
+                y=1000*asdr.hat, 
+                color=estimator, 
+                group=estimator)) +
+  facet_grid(. ~ sib.sex) +
+  theme_minimal() +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  scale_y_log10() + 
+  ylab(TeX('$\\widehat{M}^V_{\\alpha} \\times 1,000$')) +
+  xlab("") +
+  theme(legend.position="bottom")
+  #ggtitle('sibling history estimators, 7yr before survey')
+
+ggsave(filename=here('out', 'mw2000-comp-ests-12mo.pdf'),
+       plot=comp.withci.12mo,
+       height=fig.height, width=fig.width)
+
+comp.withci.12mo
+```
+
+## Sensitivity to invisible deaths
+
+**Harmonic mean**  
+
+Relative error in using visible death rate to estimate total death rate is
+
+$$
+\text{RE} = p^I_{D_\alpha} \left(\frac{1-K}{K}\right)
+$$
+
+```{r}
+# grid size
+m_grid <- 100
+
+re_pD <- function(p_i_D, K) {
+  return( p_i_D * ((1-K)/K))
+}
+  
+input <- list(scale_K_D = .2,
+              scale_p_D = .2,
+              p_i_D   = .2,
+              K       = 1)
+
+#p.vals <- seq(from=(1-input$scale_p_D)*input$p_i_D, 
+#              to=  (1+input$scale_p_D)*input$p_i_D, 
+#              length.out=m_grid)
+p.vals <- seq(from=.15, 
+              to=  .30, 
+              length.out=m_grid)
+
+K.vals <- seq(from=(1-input$scale_K_D)*input$K, 
+              to=  (1+input$scale_K_D)*input$K, 
+              length.out=m_grid)
+
+toplot.D <- expand.grid(p_i_D = p.vals,
+                        K = K.vals)
+
+toplot.D$m_v_relerr <- map2_dbl(toplot.D$p_i_D,
+                                toplot.D$K, 
+                                ~ re_pD(p_i_D=.x, K=.y))
+```
+
+```{r}
+fig.height <- 4
+fig.width <- 4
+
+invis.sens.pD <- ggplot(toplot.D, 
+       aes(x=p_i_D, y=K, z = m_v_relerr)) +
+       geom_raster(aes(fill=m_v_relerr)) +
+       geom_contour(bindwidth=.01, color='white', direction='horizontal') +
+       theme_minimal() +
+       xlab(TeX("p^I_{D}")) +
+       scale_fill_gradient2(labels=scales::percent) +
+       theme(legend.position='bottom') +
+       guides(fill=guide_colorbar(title="Relative\nerror",
+                                  barwidth=15)) 
+
+ggsave(filename=here('out', 'invis-sens-pD.pdf'),
+       plot=invis.sens.pD,
+       height=fig.height, width=fig.width)
+
+invis.sens.pD
+```
+
+**Arithmetic mean**  
+
+Relative error in using visible death rate to estimate total death rate is
+
+$$
+\text{RE} = \frac{p^I_{N_\alpha} (1-K)}{1 - p^I_{N_\alpha}(1-K)}
+$$
+
+```{r}
+# grid size
+m_grid <- 100
+
+re_pN <- function(p_i_N, K) {
+  return( (p_i_N * (1-K)) / (1 - (p_i_N * (1-K))))
+}
+  
+input <- list(scale_K_N = .2,
+              scale_p_N = .5,
+              p_i_N   = .225,
+              K       = 1)
+
+p.vals <- seq(from=.15, 
+              to=  .30, 
+              length.out=m_grid)
+#p.vals <- seq(from=(1-input$scale_p_N)*input$p_i_N, 
+#              to=  (1+input$scale_p_N)*input$p_i_N, 
+#              length.out=m_grid)
+
+K.vals <- seq(from=(1-input$scale_K_N)*input$K, 
+              to=  (1+input$scale_K_N)*input$K, 
+              length.out=m_grid)
+
+toplot.N <- expand.grid(p_i_N = p.vals,
+                        K = K.vals)
+
+toplot.N$m_v_relerr <- map2_dbl(toplot.N$p_i_N,
+                                toplot.N$K, 
+                                ~ re_pN(p_i_N=.x, K=.y))
+```
+
+```{r}
+fig.height <- 4
+fig.width <- 4
+
+invis.sens.pN <- ggplot(toplot.N, 
+       aes(x=p_i_N, y=K, z = m_v_relerr)) +
+       geom_raster(aes(fill=m_v_relerr)) +
+       geom_contour(bindwidth=.01, color='white', direction='horizontal') +
+       theme_minimal() +
+       xlab(TeX("p^I_{N}")) +
+       scale_fill_gradient2(labels=scales::percent) +
+       theme(legend.position='bottom') +
+       guides(fill=guide_colorbar(title="Relative\nerror",
+                                  barwidth=15)) 
+
+ggsave(filename=here('out', 'invis-sens-pN.pdf'),
+       plot=invis.sens.pN,
+       height=fig.height, width=fig.width)
+
+invis.sens.pN
+```
+
+
+
+## Save results
+
+```{r}
+save.image(here('out', 'temp_malawi_2000_example.RData'))
+```
+

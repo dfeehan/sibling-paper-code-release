@@ -1,0 +1,535 @@
+---
+title: "Analyze the results of the DHS sibling history simulations"
+output: html_notebook
+---
+
+```{r}
+library(surveybootstrap)
+library(networkreporting)
+library(dplyr)
+library(tidyverse)
+library(forcats)
+library(haven)
+library(igraph)
+library(lazyeval)
+library(nrsimulatr)
+
+library(tictoc)
+library(ggplot2)
+library(latex2exp)
+library(glue)
+
+library(here)
+```
+
+Load the results of the simulation
+
+```{r}
+load(here('sim-data', 'sib-simulated-surveys.RData'))
+```
+
+NOTE: we'll only look at age groups 2 to 8, i.e., ages 15 to 50
+
+```{r}
+svy.sims.forplots <- 
+  svy.sims %>%
+  filter(! cell %in% c('agegp1Xsex1', 'agegp1Xsex2', 'agegp9Xsex1', 'agegp9Xsex2'))
+
+all.truths.forplots <-
+  all.truths %>%
+  filter(! cell %in% c('agegp1Xsex1', 'agegp1Xsex2', 'agegp9Xsex1', 'agegp9Xsex2'))
+  
+all.estimands.forplots <-
+  all.estimands %>%
+  filter(! cell %in% c('agegp1Xsex1', 'agegp1Xsex2', 'agegp9Xsex1', 'agegp9Xsex2'))
+
+adj.factors.agg.forplots <-
+  adj.factors.agg %>%
+  filter(! cell %in% c('agegp1Xsex1', 'agegp1Xsex2', 'agegp9Xsex1', 'agegp9Xsex2'))
+
+adj.factors.ind.forplots <-
+  adj.factors.ind %>%
+  filter(! cell %in% c('agegp1Xsex1', 'agegp1Xsex2', 'agegp9Xsex1', 'agegp9Xsex2'))
+
+visible_truth.forplots <-
+  visible_truth %>%
+  filter(! cell %in% c('agegp1Xsex1', 'agegp1Xsex2', 'agegp9Xsex1', 'agegp9Xsex2'))
+
+agegp.labels.used <- agegp.labels[-c(1,9)]
+```
+
+
+## Plot the (simulated) underlying true death rates
+
+```{r}
+qty.names <- c('Total population death rate'='truth',
+               'Visible population death rate'='visible_truth',
+               'Visible population (inc. resp.) death rate' = 'visible_truth_withr',
+               'Invisible population death rate'='invisible_truth')
+
+sex.labs <- c('Females'='f',
+              'Males'='m')
+
+all.truth.plot <- all.truths.forplots %>%
+  separate(cell, into=c('agegp', 'sex'), sep='X') %>%
+  mutate(agegp=str_extract(agegp, '\\d'),
+         sex=str_extract(sex, '\\d')) %>%
+  mutate(agegp.lab = fct_recode(agegp, 
+                                !!!setNames(paste(agegp.labels.used), names(agegp.labels.used)))) %>%
+  mutate(sex.lab = ifelse(sex==1, 'Males', 'Females')) %>%
+  mutate(qty.lab = fct_recode(quantity,
+                              !!!qty.names)) %>%
+  ggplot(.) +
+    geom_path(aes(x=agegp.lab, y=asdr, color=qty.lab, group=interaction(qty.lab, sex))) +
+    facet_grid(sex.lab ~ .) +
+    xlab('') +
+    ylab('Simulated death rate') +
+    guides(color=guide_legend(
+                              #title='Quantity',
+                              title='',
+                              position='bottom',
+                              nrow=2)) +
+    theme_minimal() +
+    theme(legend.position='bottom')
+
+all.truth.plot
+
+pdf(here('sim-out', "sim-all-truths-m.pdf"), width=6, height=4)
+print(all.truth.plot)
+dev.off()
+```
+
+## Plot the age-sex distribution of the (simulated) universe of siblings
+
+```{r}
+qty.names <- c('Total population'='truth',
+               'Visible population'='visible_truth',
+               'Visible population (inc. resp.)' = 'visible_truth_withr',
+               'Invisible population'='invisible_truth')
+
+all.truth.exp.plot <-  all.truths.forplots %>%
+  separate(cell, into=c('agegp', 'sex'), sep='X') %>%
+  mutate(agegp=str_extract(agegp, '\\d'),
+         sex=str_extract(sex, '\\d')) %>%
+  mutate(agegp.lab = fct_recode(agegp, 
+                                !!!setNames(paste(agegp.labels.used), names(agegp.labels.used)))) %>%
+  mutate(sex.lab = ifelse(sex==1, 'Males', 'Females')) %>%
+  mutate(qty.lab = fct_recode(quantity,
+                              !!!qty.names)) %>%
+  ggplot(.) +
+    geom_path(aes(x=agegp.lab, y=N.cell, color=qty.lab, group=interaction(qty.lab, sex))) +
+    facet_grid(sex.lab ~ .) +
+    xlab('') +
+    ylab('Simulated population size') +
+    guides(color=guide_legend(
+                              title='',
+                              #title='Quantity',
+                              position='bottom',
+                              nrow=2)) +
+    theme_minimal() +
+    theme(legend.position='bottom')
+
+all.truth.exp.plot
+
+pdf(here('sim-out', "sim-all-truths-n.pdf"), width=6, height=4)
+print(all.truth.exp.plot)
+dev.off()
+```
+
+### Summarize the estimates
+
+```{r}
+res.summ <- svy.sims.forplots %>%
+  filter(! cell %in% c('agegp1Xsex1', 'agegp1Xsex2', 'agegp9Xsex1', 'agegp9Xsex2')) %>%
+  group_by(f, cell, estimator, uber.tau.D, uber.tau.N) %>%
+  summarize(asdr = mean(asdr.hat),
+            asdr.ci.low = quantile(asdr.hat, .025),
+            asdr.ci.high = quantile(asdr.hat, .975))
+
+res.summ
+```
+
+
+# Plot the simulation results
+
+## Plots that demonstrate the sensitivity frameworks are correct
+
+Construct a dataset that compares the estimands, adjusted estimands, and true visible death rates.
+If the sensitivity frameworks are correct, then the adjusted estimands should be equal to the true
+visible death rates.
+
+```{r}
+# results to plot for estimators without respondent included
+sens.check <- all.estimands.forplots %>%
+          select(cell, asdr, uber.tau.N, uber.tau.D, quantity=estimand) %>%
+          filter(quantity %in% c('estimand_agg', 'estimand_agg_adj',
+                                 'estimand_ind', 'estimand_ind_adj')) %>%
+          separate(quantity, 
+                   into=c('foo', 'estimator', 'adjusted'), 
+                   sep="\\_", fill='right')   %>%
+          select(-foo) %>%
+          mutate(adjusted = case_when(is.na(adjusted) ~ 'unadjusted',
+                                      TRUE ~ 'adjusted')) %>%
+          ungroup() %>%
+          left_join(all.truths.forplots %>%
+                      filter(quantity %in% c('visible_truth')) %>%
+                      select(cell, true_visible_asdr=asdr),
+                    by='cell') %>%
+          ## split cell into readable age/sex groups
+          separate(cell, into=c('agegp', 'sex'), sep='X') %>%
+          mutate(agegp = str_extract(agegp, '\\d'),
+                 sex = str_extract(sex, '\\d')) %>%
+          mutate(agegp.lab = fct_recode(agegp, 
+                                    !!!setNames(paste(agegp.labels.used), 
+                                                names(agegp.labels.used)))) %>%
+          mutate(sex.lab = ifelse(sex==1, 'M', 'F'))
+
+# results to plot for estimators with respondents included
+sens.check.withR <- all.estimands.forplots %>%
+          select(cell, asdr, uber.tau.N, uber.tau.D, quantity=estimand) %>%
+          ## TODO !!!
+          ## need to calculate and use estimand_agg_withR_adj and estimand_ind_withR_adj
+          filter(quantity %in% c('estimand_agg_withR', 'estimand_agg_withR_adj',
+                                 'estimand_ind_withR', 'estimand_ind_withR_adj'))  %>%
+          mutate(adjusted = case_when(quantity=='estimand_agg_withR_adj' ~ 'adjusted',
+                                      quantity=='estimand_ind_withR_adj' ~ 'adjusted',
+                                      TRUE ~ 'unadjusted'),
+                 estimator = case_when(quantity=='estimand_agg_withR' ~ 'agg_withR',
+                                       quantity=='estimand_agg_withR_adj' ~ 'agg_withR',
+                                       TRUE ~ 'ind_withR'))  %>%
+          ungroup() %>%
+          ## split cell into readable age/sex groups
+          left_join(all.truths.forplots %>%
+                      filter(quantity %in% c('visible_truth_withr')) %>%
+                      select(cell, true_visible_asdr=asdr),
+                    by='cell') %>%
+          separate(cell, into=c('agegp', 'sex'), sep='X') %>%
+          mutate(agegp = str_extract(agegp, '\\d'),
+                 sex = str_extract(sex, '\\d')) %>%
+          mutate(agegp.lab = fct_recode(agegp, 
+                                    !!!setNames(paste(agegp.labels.used), names(agegp.labels.used)))) %>%
+          mutate(sex.lab = ifelse(sex==1, 'M', 'F')) 
+         
+```
+
+These will be helpful for labeling the next few plots...
+
+```{r}
+appender_tau_N <- function(string) {
+    TeX(paste("$\\tau_N = $", string))
+}
+appender_tau_D <- function(string) {
+    TeX(paste("$\\tau_D = $", string))
+}
+```
+
+### Aggregate estimator - not including respondent
+
+```{r}
+
+## check aggregate estimator without respondent included
+agg.check.plot <-  ggplot(sens.check %>% 
+                            filter(estimator=='agg')) +
+  geom_abline(intercept=0, slope=1, color='grey') +
+  geom_point(aes(x=true_visible_asdr, 
+                 y=asdr, 
+                 color=sex.lab, 
+                 shape=adjusted)) +
+  facet_grid(uber.tau.N ~ uber.tau.D, 
+             labeller=labeller(uber.tau.D = as_labeller(appender_tau_D, default=label_parsed),
+                               uber.tau.N = as_labeller(appender_tau_N, default=label_parsed))) +
+  xlab("True visible death rate") +
+  ylab("Death rate estimand") +
+  scale_color_discrete(name='') +
+  scale_shape_discrete(name='') +
+  ggtitle('Aggregate visibility estimator') +
+  theme_minimal()
+
+pdf(here('sim-out', "agg-check-plot.pdf"), width=10, height=10)
+print(agg.check.plot)
+dev.off()
+
+agg.check.plot
+```
+
+### Individual estimator - not including respondent
+
+```{r}
+## check individual estimator without respondent included
+ind.check.plot <-  ggplot(sens.check %>% 
+                            filter(estimator=='ind')) +
+  geom_abline(intercept=0, slope=1, color='grey') +
+  geom_point(aes(x=true_visible_asdr, 
+                y=asdr, 
+                color=sex.lab, 
+                shape=adjusted)) +
+  facet_grid(uber.tau.N ~ uber.tau.D, 
+             labeller=labeller(uber.tau.D = as_labeller(appender_tau_D, default=label_parsed),
+                               uber.tau.N = as_labeller(appender_tau_N, default=label_parsed))) +
+  xlab("True visible death rate") +
+  ylab("Death rate estimand") +
+  scale_color_discrete(name='') +
+  scale_shape_discrete(name='') +
+  ggtitle('Individual visibility estimator') +
+  theme_minimal()
+
+pdf(here('sim-out', "ind-check-plot.pdf"), width=10, height=10)
+print(ind.check.plot)
+dev.off()
+
+ind.check.plot
+
+```
+
+### Aggregate estimator - including respondent
+
+```{r}
+## check aggregate estimator without respondent included
+agg.withR.check.plot <-  ggplot(sens.check.withR %>% 
+                            filter(estimator=='agg_withR')) +
+  geom_abline(intercept=0, slope=1, color='grey') +
+  geom_point(aes(x=true_visible_asdr, 
+                 y=asdr, 
+                 color=sex.lab, 
+                 shape=adjusted)) +
+  facet_grid(uber.tau.N ~ uber.tau.D, 
+             labeller=labeller(uber.tau.D = as_labeller(appender_tau_D, default=label_parsed),
+                               uber.tau.N = as_labeller(appender_tau_N, default=label_parsed))) +
+  xlab("True visible death rate\n(Including respondent)") +
+  ylab("Death rate estimand") +
+  scale_color_discrete(name='') +
+  scale_shape_discrete(name='') +
+  ggtitle('Aggregate visibility estimator (respondent included)') +
+  theme_minimal()
+
+pdf(here('sim-out', "agg-withR-check-plot.pdf"), width=10, height=10)
+print(agg.withR.check.plot)
+dev.off()
+
+agg.withR.check.plot
+```
+
+### Individual estimator - including respondent
+
+```{r}
+## check individual estimator without respondent included
+ind.withR.check.plot <-  ggplot(sens.check.withR %>% 
+                            filter(estimator=='ind_withR')) +
+  geom_abline(intercept=0, slope=1, color='grey') +
+  geom_point(aes(x=true_visible_asdr, 
+                y=asdr, 
+                color=sex.lab, 
+                shape=adjusted)) +
+  facet_grid(uber.tau.N ~ uber.tau.D, 
+             labeller=labeller(uber.tau.D = as_labeller(appender_tau_D, default=label_parsed),
+                               uber.tau.N = as_labeller(appender_tau_N, default=label_parsed))) +
+  xlab("True visible death rate\n(including respondent)") +
+  ylab("Death rate estimand") +
+  scale_color_discrete(name='') +
+  scale_shape_discrete(name='') +
+  ggtitle('Individual visibility estimator (respondent included)') +
+  theme_minimal()
+pdf(here('sim-out', "ind-withR-check-plot.pdf"), width=10, height=10)
+
+print(ind.withR.check.plot)
+dev.off()
+
+ind.withR.check.plot
+
+```
+## Plots that summarize the error
+
+Summarize the MSE wrt true visible death rate (excl. respondent) for all estimators
+
+```{r}
+dodge.width <- .75
+
+est.names <- c('Aggregate'='agg',
+               'Aggregate (with resp.)'='agg_withR',
+               'Individual'='ind',
+               'Individual (with resp.)'='ind_withR')
+
+plots.mse.summ <- svy.sims.forplots %>%
+  split(interaction(.$f, .$uber.tau.D, .$uber.tau.N)) %>%
+  
+  map(function(df) {
+    
+    mse.summ <- df %>%
+      left_join(visible_truth.forplots %>% 
+                  select(cell, true.vis.asdr=asdr),
+                by=c('cell')) %>%
+      group_by(estimator, cell) %>%
+      dplyr::summarise(mse = mean((1000*asdr.hat - 1000*true.vis.asdr)^2),
+                       var = var(1000*asdr.hat),
+                       bias2 = (1000*mean(true.vis.asdr-asdr.hat))^2)  %>%
+      separate(cell, into=c('agegp', 'sex'), sep='X') %>%
+      mutate(agegp = str_extract(agegp, '\\d'),
+             sex = str_extract(sex, '\\d'))
+    
+    toplot <- mse.summ %>%
+      ungroup() %>%
+      dplyr::mutate(agegp.lab = fct_recode(agegp, 
+                                           !!!setNames(paste(agegp.labels.used), 
+                                                       names(agegp.labels.used)))) %>%
+      dplyr::mutate(sex.lab = ifelse(sex==1, 'M', 'F')) %>%
+      dplyr::mutate(est.lab = as_factor(estimator),
+             est.lab = fct_recode(est.lab,
+                                  !!!est.names))
+        
+    mse.plot <- ggplot(toplot) +
+      #geom_bar(aes(x=agegp, y=mse, fill=estimator), stat='identity', position=position_dodge()) +
+      geom_point(aes(x=agegp.lab, y=mse, color=est.lab, shape='mse'), 
+                 stat='identity', 
+                 position=position_dodge(width=dodge.width)) +
+      geom_point(aes(x=agegp.lab, y=var, color=est.lab, shape='var'), 
+                 stat='identity', 
+                 position=position_dodge(width=dodge.width)) +
+      geom_point(aes(x=agegp.lab, y=bias2, color=est.lab, shape='bias2'), 
+                 stat='identity', 
+                 position=position_dodge(width=dodge.width)) +
+      facet_grid(sex.lab ~ .) +
+      scale_shape_manual(name='quantity',
+                         values=c(1,3,4)) +
+      xlab('') +
+      ylab('Mean square error\n(w.r.t. visible truth excl. R)') +
+      ggtitle(TeX(glue(
+        "Sampling fraction: {df$f[1]}, $\\tau_N$: {df$uber.tau.N[1]}; $\\tau_D$: {df$uber.tau.D[1]}",
+        ))) +
+      guides(color=guide_legend(title='Estimator'),
+             shape=guide_legend(title='Quantity')) +
+      theme_minimal() +
+      theme(legend.position='bottom',
+            legend.box='vertical')
+    
+    return(mse.plot)
+  })
+
+pdf(here('sim-out', "prelim-sim-mse-results.pdf"), width=7, height=4)
+print(plots.mse.summ)
+dev.off()
+
+pdf(here('sim-out', "sim-mse-results-f3.pdf"), width=7, height=7)
+print(plots.mse.summ[[3]])
+dev.off()
+
+plots.mse.summ
+```
+
+Summarize the MSE wrt true visible death rate (excl. respondent) for estimators that exclude respondents only
+
+```{r}
+dodge.width <- .5
+
+est.names <- c('Aggregate'='agg',
+               'Aggregate (with resp.)'='agg_withR',
+               'Individual'='ind',
+               'Individual (with resp.)'='ind_withR')
+
+## scaling factor by which death rates get multiplied
+## (sometimes it's nice to have death rates per 1,000, etc)
+Kasdr <- 1000
+
+plots.mse.exclr <- svy.sims.forplots %>%
+  split(interaction(.$uber.tau.D, .$uber.tau.N, .$f)) %>%
+  map(function(df) {
+    
+    mse.summ <- df %>%
+      left_join(visible_truth.forplots %>% select(cell, true.vis.asdr=asdr),
+                by=c('cell')) %>%
+      group_by(estimator, cell) %>%
+      dplyr::summarise(
+                relmse = (mean((Kasdr*asdr.hat - Kasdr*true.vis.asdr)^2)/(Kasdr*true.vis.asdr[1])),
+                relvar = var(Kasdr*asdr.hat)/(Kasdr*true.vis.asdr[1]),
+                relbias2 = ((Kasdr*mean(true.vis.asdr-asdr.hat))^2)/(Kasdr*true.vis.asdr[1])) %>%
+      separate(cell, into=c('agegp', 'sex'), sep='X') %>%
+      dplyr::mutate(agegp = str_extract(agegp, '\\d'),
+             sex = str_extract(sex, '\\d')) %>%
+      dplyr::mutate(agegp.lab = fct_recode(agegp, !!!setNames(paste(agegp.labels.used), 
+                                                              names(agegp.labels.used)))) %>%
+      dplyr::mutate(sex.lab = ifelse(sex==1, 'm', 'f'))
+
+      toplot <- mse.summ %>%
+        ungroup() %>%
+        dplyr::mutate(agegp.lab = fct_recode(agegp, 
+                                  !!!setNames(paste(agegp.labels.used), 
+                                              names(agegp.labels.used)))) %>%
+        dplyr::mutate(sex.lab = ifelse(sex==1, 'M', 'F')) %>%
+        dplyr::mutate(est.lab = as_factor(estimator),
+               est.lab = fct_recode(est.lab,
+                                    !!!est.names)) 
+    
+    mse.plot.exclr <- ggplot(toplot %>% 
+                               ungroup() %>%
+                               filter(estimator %in% c('agg', 'ind'))  %>% 
+                               mutate(est.lab=fct_drop(est.lab))) +
+      #geom_bar(aes(x=agegp, y=mse, fill=estimator), stat='identity', position=position_dodge()) +
+      geom_point(aes(x=agegp.lab, y=relmse, color=est.lab, shape='mse'), 
+                 stat='identity', 
+                 position=position_dodge(width=dodge.width)) +
+      geom_point(aes(x=agegp.lab, y=relvar, color=est.lab, shape='var'), 
+                 stat='identity', 
+                 position=position_dodge(width=dodge.width)) +
+      geom_point(aes(x=agegp.lab, y=relbias2, color=est.lab, shape='bias2'), 
+                 stat='identity', 
+                 position=position_dodge(width=dodge.width)) +
+      facet_grid(sex.lab ~ .) +
+      scale_shape_manual(name='quantity',
+                         values=c(1,3,4)) +
+      ylab('Relative mean square error\n(w.r.t. visible truth excl. R)') +
+      xlab('') +
+      ggtitle(paste0('Sampling fraction: ', df$f[1], 
+                     '; tau.D: ', df$uber.tau.D[1], 
+                     '; tau.N: ', df$uber.tau.N[1])) +
+      theme_minimal() +
+      guides(color=guide_legend(title='Estimator'),
+             shape=guide_legend(title='Quantity')) +
+      theme(legend.position='bottom',
+            legend.box='vertical')
+          
+    return(mse.plot.exclr)
+  })
+
+pdf(here('sim-out', "prelim-sim-mse-exclr-results.pdf"), width=7, height=4)
+print(plots.mse.exclr)
+dev.off()
+
+pdf(here('sim-out', "sim-mse-results-withoutresp-f05-imperfectreporting.pdf"), width=7, height=7)
+print(plots.mse.exclr[[3]])
+dev.off()
+
+pdf(here('sim-out', "sim-mse-results-withoutresp-f05-perfectreporting.pdf"), width=7, height=7)
+print(plots.mse.exclr[[4]])
+dev.off()
+
+plots.mse.exclr
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

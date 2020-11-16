@@ -1,0 +1,1725 @@
+---
+title: "Sibling simulation study"
+output: html_notebook
+---
+
+# Setup
+
+TODO:
+
+* add different parameterization for invisible deaths; 
+this could be done at the stage where respondents w/ no sibs
+  get added to sibling universe. Obviously, the respondents are all alive -- we need corresponding
+  dead respondents
+* think about actual simulation study that will show up in the paper
+  
+DESIGN CONSIDERATIONS
+* be sure that the sib universe is separated from the rest of the study, so that different
+  universes can be adopted
+* think about best way to handle individual-level reporting; very hard to do at invidiual level - maybe best way is to remove edges in aggregate and look at what the realized empirical quantities are for each individual after doing so
+  
+
+
+```{r}
+## TODO - this is sensitive to the order in which the libraries are opened
+## due at least in part to dhstools, which imports plyr
+## TODO: to fix this, dhstools and other packages should just call plyr::whatever, i think
+#library(dhstools)
+
+library(wpp2017)
+library(surveybootstrap)
+library(networkreporting)
+
+#library(devtools); load_all("~/Dropbox/library/nrsimulatr/")
+# install this package using:
+#install_github('dfeehan/nrsimulatr')
+library(nrsimulatr)
+
+# igraph maskss some tidyverse functions, so load it first
+# (to give preference to tidyverse fns)
+library(igraph)
+
+#library(plyr); 
+#library(dplyr)
+library(tidyverse)
+library(forcats)
+library(haven)
+library(lazyeval)
+library(tictoc)
+
+
+library(future)
+library(furrr)
+
+library(here)
+
+#parallel <- FALSE
+parallel <- TRUE
+
+num.cores <- 7 
+
+if(parallel) {
+  ## this is needed to avoid running out of memory errors w/ future package
+  ## see 
+  ## https://github.com/HenrikBengtsson/future/issues/185
+  options(future.globals.maxSize = 768 * 1024^2)
+}
+```
+
+```{r}
+tic("Running simulation file...")
+```
+
+Load the Malawi 2000 DHS data, which we prepared in `01_get_data.Rmd`
+
+```{r}
+load(file=here('data', "malawi_dhs_2000.RData"))
+```
+
+# Create the universe
+
+We'll create a population or universe of people with sibships.
+We'll construct the universe to match the one suggested by the sibling reports
+from the 2000 Malawi survey.
+
+## Universe of sibships
+
+This creates a dataframe, `obs.sibships`, that has one row per sibship (no matter how big
+the sibship is).
+
+```{r}
+## for simplicity, we'll assume each respondent to the Malawi DHS tells us about a distinct sibship
+obs.sibships <- mw.ego %>%
+  select(caseid, scaledweight)
+
+```
+
+## Universe of siblings
+
+This creates a dataframe, `obs.sibs`, that has one row per sibling, including the respondents.
+
+```{r}
+## dataset of siblings (ie, one row is one person)
+obs.sibs <- mw.sib %>%
+  select(caseid, 
+	 sex=sib.sex, 
+         age=sib.age, 
+         alive=sib.alive, 
+	 doi, 
+         death.date=sib.death.date, 
+	 death.age=sib.death.age) %>% 
+  mutate(age.cat10=cut(age,
+           breaks=c(0, seq(from=15,to=50,by=10),95),
+           include.lowest=TRUE, right=FALSE),
+         age.cat5=cut(age,
+           breaks=c(0, seq(from=15,to=50,by=5),95),
+           include.lowest=TRUE, right=FALSE)) %>%
+  # these are sibs that were reported about -- none were actually interviewed (as the source of this report)
+  mutate(interviewed = 0)
+
+## we need to add the survey respondents to the sibling dataset;
+## first, get the right rows to add
+ego.as.sib <- mw.ego %>%
+  mutate(eligible=TRUE,
+         death.date=-1,
+         death.age=NA,
+         alive=1,
+         interviewed=1) %>%
+  select(caseid, sex, 
+         age, 
+         age.cat5=age.cat, 
+         age.cat10, 
+         alive, interviewed, doi, death.date)
+
+## now combine with the sibling dataset
+obs.sibs <- obs.sibs %>% bind_rows(ego.as.sib)
+```
+
+Set up age and sex groups
+
+```{r}
+## label for the sex cateogories
+sex.labels <- c('m'=1, 'f'=2)
+
+####
+## uncomment for
+## 5-year age gps
+obs.sibs <- obs.sibs %>% mutate(age.cat = forcats::as_factor(age.cat5))
+
+age.gp.breaks <- c(0, seq(from=15,to=50,by=5),95)
+
+## rename agegps to have simple labels to keep interaction vars simple
+agegp.labels <- c( '[0,15)'=1, 
+                  '[15,20)'=2,
+                  '[20,25)'=3, 
+                  '[25,30)'=4, 
+                  '[30,35)'=5, 
+                  '[35,40)'=6, 
+                  '[40,45)'=7, 
+                  '[45,50)'=8, 
+                  '[50,95]'=9)
+```
+
+Attribute each sib's exposure to an age group
+
+```{r}
+## agegp for exposure (we'll use age at death if dead; otherwise, age)
+obs.sibs <- obs.sibs %>%
+  mutate(death.age.cat = cut(death.age,
+                             breaks=age.gp.breaks,
+                             include.lowest=TRUE, right=FALSE),
+         exp.agegp = case_when(alive == 1 ~ age.cat,
+                               alive == 0 ~ death.age.cat,
+                               TRUE ~ NA_integer_))
+
+```
+
+
+#### Simulate deaths among siblings based on the WPP 2017 estimated adult death rates for Malawi
+
+Get 'true' probabilities of death in the past year to
+base simulation on
+
+```{r}
+# from wpp2017 package: female and male death rate estimates
+data(mxF) 
+data(mxM)
+
+asdr.f <- mxF %>% 
+  filter(name == 'Malawi') %>%
+  mutate(sex='f') %>%
+  select(age, sex, 'asdr' = `2000-2005`) %>%
+  filter( !is.na(asdr)) %>%
+  filter( age <= 95) %>%
+  mutate(age.cat = cut(age,
+                       breaks=age.gp.breaks,
+                       include.lowest=TRUE, right=FALSE))
+
+asdr.m <- mxM %>% 
+  filter(name == 'Malawi') %>%
+  mutate(sex='m') %>%
+  select(age, sex, 'asdr' = `2000-2005`) %>%
+  filter( !is.na(asdr)) %>%
+  filter( age <= 95) %>%
+  mutate(age.cat = cut(age,
+                       breaks=age.gp.breaks,
+                       include.lowest=TRUE, right=FALSE))
+
+# get crude estimates for death rate in age groups
+asdr.f <- asdr.f %>%
+  group_by(sex, age.cat) %>%
+  # use the geometric mean asdr as a crude approximation
+  summarize(asdr = exp(mean(log(asdr))))
+
+asdr.m <- asdr.m %>%
+  group_by(sex, age.cat) %>%
+  # use the geometric mean asdr as a crude approximation
+  summarize(asdr = exp(mean(log(asdr))))
+
+target.true.nmx <- bind_rows(asdr.f, asdr.m)
+
+ggplot(target.true.nmx) +
+  geom_line(aes(x=age.cat, y=asdr, color=sex, group=sex)) +
+  theme_minimal() +
+  ggtitle('Target true 1mx')
+
+ggplot(target.true.nmx) +
+  geom_line(aes(x=age.cat, y=log(asdr), color=sex, group=sex)) +
+  theme_minimal() +
+  ggtitle('Target true log(1mx)')
+
+```
+
+Remove siblings with missing age in the Malawi data (65 of these)
+
+```{r}
+## remove observations w/ missing age info (65 of these)
+caseids.withmiss <- obs.sibs %>% filter(is.na(exp.agegp)) %>% select(caseid) %>% pull(caseid)
+
+obs.sibships <- obs.sibships %>% filter(! caseid %in% caseids.withmiss)
+obs.sibs <- obs.sibs %>% filter(! caseid %in% caseids.withmiss)
+```
+
+We'll only simulate death/survival among siblings who, in reality, were living at some point
+in the 7 years before the survey. So we'll calculate a few variables useful for keeping track
+of this.
+
+```{r}
+obs.sibs <- obs.sibs %>%
+  ## these orig.[ETC] vars are what happened in the Malawi DHS (not what we'll simulate)
+  mutate(orig.died.past12mo = ifelse(death.date != -1,
+                                ifelse(doi - death.date <= 12,
+                                       1,
+                                       0),
+                                0),
+         orig.died.past7yr = ifelse(death.date != -1,
+                                ifelse(doi - death.date <= 12*7,
+                                       1,
+                                       0),
+                                0),
+         orig.lived.past7yr = ifelse(death.date != -1,
+                                ifelse(orig.died.past7yr, 1, 0), 
+                                1),
+         lived.past7yr = orig.lived.past7yr
+         )
+
+with(obs.sibs, table(lived.past7yr, orig.lived.past7yr))
+```
+
+Now randomly simulate which sibs live and which sibs die, based on the WPP death rates
+
+```{r}
+set.seed(101010)
+
+obs.sibs <- obs.sibs %>%
+  ## we'll use current age group as age gp of death, where applicable;
+  ## this is needed to fill in cases where
+  mutate(death.age.cat = exp.agegp) %>%
+  left_join(target.true.nmx %>% select(exp.agegp=age.cat, sex, target.asdr=asdr)) %>%
+  mutate(died.past7yr = rpois(n=rep(1, n()), lambda=target.asdr*7),
+         died.past7yr = ifelse(died.past7yr > 1, 1, died.past7yr),
+         # if sib didn't live at all in the past 7 yrs, can't have died in past 7 yr
+         died.past7yr = ifelse(lived.past7yr == 0, 0, died.past7yr)) %>%
+  ## sibs are dead if either they died in the past 7 years, 
+  ## or if they didn't live in the past 7 years
+  mutate(alive = case_when(died.past7yr == 1 ~ 0,
+                           lived.past7yr == 0 ~ 0,
+                           TRUE ~ as.integer(alive)))
+
+#with(obs.sibs %>% filter(lived.past7yr == 1), table(died.past7yr))
+with(obs.sibs, table(lived.past7yr, died.past7yr))
+```
+
+
+## Construct pseudo-universe of all sibships
+
+At this point, we have reconstructed dataframes describing the sibships reported
+in the Malawi survey. (We assume these are all disjoint.)
+
+Next, our goal is to start from this dataframe and construct a pseudo-universe that
+we can use as a basis for studying sampling properties of different estimators.
+
+To create this pseudo-universe, we'll follow a couple of steps:
+
+* randomly sample sibships from the observed Malawi data with probability proportional
+  to one over their visibilities (to reconstruct the population-level sibship distribution)
+* randomly flip the sexes is 50% of the resampled sibships 
+  (to account for the fact that only women were interviewed, but the population has women and men)
+
+```{r}
+## this is roughly the visibility (ie, the chance that each sibship was represented in the DHS);
+## we'll use the visibility when resampling
+dhs_elig <- obs.sibs %>% 
+  mutate(dhs_elig = as.numeric((sex == 'f') & (! is.na(age)) & (age >= 15) & (age <= 49))) %>%
+  group_by(caseid) %>% 
+  summarize(mult.wgt.dhs = n() / sum(dhs_elig))
+
+obs.sibships <- obs.sibships %>%
+  left_join(dhs_elig, by='caseid')
+```
+
+Now resample from the DHS data to get a population universe of sibships
+
+```{r}
+## seed PRNG to guarantee replicability of results
+set.seed(100)
+
+## the number of sibships to resample from the DHS data
+#target.num.siblings <- 5000
+target.num.sibships <- 20000
+
+## varying the size here controls the eventual size of the universe of siblings
+## that we end up with
+## sample with replacement, so we can generate a biggger popn than we started from
+samp.sibship.ids <- sample(obs.sibships$caseid, 
+                           size=target.num.sibships, 
+                           prob=obs.sibships$mult.wgt.dhs, 
+                           replace=TRUE)
+
+## sample to determine whether or not we will flip the sexes of each
+## resampled sibship
+flip.sex <- sample(c(0,1), size=length(samp.sibship.ids), replace=TRUE)
+
+## df of sampled sibships to include in our pseudo-universe
+pseudou.sibships <- data.frame(caseid = samp.sibship.ids,
+                               flip.sex = flip.sex) 
+
+## make a caseid with uniquely resampled sibship id
+## (this way sibships that were sampled more than once will be treated as
+##  distinct sibships in the pseudouniverse)
+pseudou.sibships <- 
+  pseudou.sibships %>%
+  group_by(caseid) %>%
+  mutate(universeid = paste0(caseid, '.', 1:n()))
+
+pseudou.sibships
+```
+
+Add the characteristics of the sibships to the resampled population
+
+```{r}
+## join characteristics of the sibships onto the resampled dataset
+pseudou.sibs <- pseudou.sibships %>%
+  left_join(obs.sibs, by='caseid')
+
+## get rid of caseid (the original id from the DHS survey); 
+## now that we've joined sibship characteristics
+## on, we'll only need universeid, which is the sibship ID in the universe we've simulated
+pseudou.sibships <- pseudou.sibships %>% ungroup() %>% select(-caseid)
+pseudou.sibs <- pseudou.sibs %>% ungroup() %>% select(-caseid)
+
+## flip sexes where needed
+pseudou.sibs <- pseudou.sibs %>%
+  mutate(sex = case_when(flip.sex == 1 & sex == 'f' ~ 'm',
+                         flip.sex == 1 & sex == 'm' ~ 'f',
+                         TRUE ~ sex))
+
+## and lose flip.sex to avoid confusion in the future
+pseudou.sibs <- pseudou.sibs %>% select(-flip.sex)
+pseudou.sibships <- pseudou.sibships %>% select(-flip.sex)
+
+## here, we remove sibs who are neither alive nor died in the past 7 years
+## this means, e.g., sibs who died at age 1 a long time ago are often dropped
+## this explains why gk.weight and sibship.size may look surprising below; those quantities
+## include these dropped sibs 
+pseudou.sibs <- pseudou.sibs %>% filter(alive | died.past7yr)
+
+## finally, we can now calculate sibship size
+pseudou.sibs <- pseudou.sibs %>%
+  group_by(universeid) %>%
+  mutate(sibship.size = n()) %>%
+  ungroup()
+
+
+pseudou.sibships <- pseudou.sibships %>%
+  left_join(pseudou.sibs %>% 
+              group_by(universeid) %>% 
+              slice(1) %>% 
+              select(universeid, sibship.size),
+            by='universeid')
+  
+## at this point, sibling universe is like a census of all individuals -- it has the info
+## about each individual sibling in the population (the universe)
+## it gets fed into create_sibship when creating sibship network objects below
+```
+
+Calculate eligibility for inclusion in the simulated surveys.
+
+We'll assume the same as the DHS: living female sibs between 15 and 49 are eligible
+
+```{r}
+pseudou.sibs <- pseudou.sibs %>%
+  mutate(eligible = case_when(alive == 1 & (age >= 15 & age <= 49) & (sex == 'f') ~ 1,
+                              TRUE ~ 0))
+```
+
+Create indicator variables for different group memberships (age/sex/died).
+
+```{r}
+pseudou.sibs <- pseudou.sibs %>%
+  mutate(agegp = recode_factor(pseudou.sibs$exp.agegp, 
+                               !!!agegp.labels),
+         sex = recode_factor(as_factor(pseudou.sibs$sex),
+                             !!!sex.labels),
+         eligible = as.numeric(eligible),
+         exp=1)
+
+cell.vars <- model.matrix(~ agegp*sex-1, 
+                          contrasts.arg=list(agegp=diag(nlevels(pseudou.sibs$agegp)),
+                                             sex=diag(nlevels(pseudou.sibs$sex))),
+                          pseudou.sibs)
+colnames(cell.vars) <- str_replace_all(colnames(cell.vars), ":", "X")
+  
+
+## exposure
+interaction.vars.N <- model.matrix(~ agegp:sex:exp - 1, 
+                                   contrasts.arg=list(agegp=diag(nlevels(pseudou.sibs$agegp)),
+                                                      sex=diag(nlevels(pseudou.sibs$sex))),
+                                   pseudou.sibs)
+colnames(interaction.vars.N) <- str_replace_all(colnames(interaction.vars.N), ":", "X")
+
+## deaths
+interaction.vars.D <- model.matrix(~ agegp:sex:died.past7yr - 1, 
+                                   contrasts.arg=list(agegp=diag(nlevels(pseudou.sibs$agegp)),
+                                                      sex=diag(nlevels(pseudou.sibs$sex))),
+                                   pseudou.sibs)
+colnames(interaction.vars.D) <- str_replace_all(colnames(interaction.vars.D), ":", "X")
+
+## frame
+interaction.vars.F <- model.matrix(~ agegp:sex:eligible - 1, 
+                                   contrasts.arg=list(agegp=diag(nlevels(pseudou.sibs$agegp)),
+                                                      sex=diag(nlevels(pseudou.sibs$sex))),
+                                   pseudou.sibs)
+colnames(interaction.vars.F) <- str_replace_all(colnames(interaction.vars.F), ":", "X")
+
+## exposure*frame (needed for individual estimator)
+interaction.vars.NxF <- model.matrix(~ agegp:sex:exp:eligible - 1, 
+                                   contrasts.arg=list(agegp=diag(nlevels(pseudou.sibs$agegp)),
+                                                      sex=diag(nlevels(pseudou.sibs$sex))),
+                                   pseudou.sibs)
+colnames(interaction.vars.NxF) <- str_replace_all(colnames(interaction.vars.NxF), ":", "X")
+
+ivs <- c(colnames(cell.vars), 
+         colnames(interaction.vars.D), 
+         colnames(interaction.vars.N), 
+         colnames(interaction.vars.F),
+         colnames(interaction.vars.NxF))
+
+ivs.D <- colnames(interaction.vars.D)
+ivs.N <- colnames(interaction.vars.N)
+ivs.F <- colnames(interaction.vars.F)
+ivs.NxF <- colnames(interaction.vars.NxF)
+
+## subset of the interaction vars that have cell membership (ie, age/sex gp membership)
+ivs.cells <- colnames(cell.vars)[str_detect(colnames(cell.vars), 'X')]
+
+pseudou.sibs <- cbind(pseudou.sibs, cell.vars)
+pseudou.sibs <- cbind(pseudou.sibs, interaction.vars.D)
+pseudou.sibs <- cbind(pseudou.sibs, interaction.vars.N)
+pseudou.sibs <- cbind(pseudou.sibs, interaction.vars.F)
+pseudou.sibs <- cbind(pseudou.sibs, interaction.vars.NxF)
+
+## make an id which is unique for each person in the universe
+pseudou.sibs$id <- 1:nrow(pseudou.sibs)
+```
+
+### Make a pseudo-universe level sibship network
+
+```{r}
+## this function creates a clique representing the given sibship
+##   cur.sib - the row of the sibship universe table w/ sibship information
+##   sib.ind - the universe of siblings, which is used for the sibship members' attributes
+create_sibship <- function(cur.sib, sib.ind) {
+  
+  # grab the sibship
+  ind.sibs <- sib.ind %>% filter(universeid == cur.sib$universeid)
+  
+  g <- make_full_graph(nrow(ind.sibs))  
+  
+  vertex_attr(g) <- as.list(ind.sibs)
+  
+  return(g)
+  
+}
+
+```
+
+This step takes about 20 minutes on the cluster
+
+```{r}
+tic("Creating network objects for samples sibships")
+if(parallel) {
+  plan(multiprocess, workers=num.cores)
+}
+
+
+## create a network object for each sampled sibship
+## (each of these networks will be a clique)
+sibship.graph.list <- pseudou.sibships %>%
+  split(1:nrow(pseudou.sibships)) %>%
+  future_map(create_sibship, sib.ind=pseudou.sibs)
+  #map(create_sibship, sib.ind=pseudou.sibs)
+
+## take the union of all of the individual sibship networks to get
+## the population network of sibships -- 
+## a set of disjoint cliques, one per sibship
+pseudou.network <- do.call("disjoint_union", sibship.graph.list)
+
+## add an ID variable
+## this uniquely identifies individuals in the universe
+#pseudou.network <- set.vertex.attribute(pseudou.network, 'id', value=1:vcount(pseudou.network))
+
+if(parallel) {
+  plan(sequential)
+}
+toc()
+```
+
+### Make pseudo-universe level reporting networks
+
+At this point, `sib.network` is an undirected, social network with nodes connected to their siblings.
+
+Now we'll create reporting networks from this universe.
+
+We'll define two functions: the first will create a reporting network from a sibship network
+when reporting is perfect; the second will create a reporting network from a sibship network
+when reporting is not perfect.
+
+```{r}
+sib.perfect.reporting <- function(cur.net, ivs) {
+ 
+  V(cur.net)$eligible  <- as.numeric(V(cur.net)$eligible)
+  V(cur.net)$all       <- 1
+  
+  # ivs are the names of the interacted age/sex variables
+  params <- list(groups=c(ivs, 'all', 'eligible'),
+                 gps.in.F = 'eligible',
+                 gps.in.H = c('died.past7yr', 'exp', 'eligible', 'expXeligible'))
+    
+  ex.params <- existing_params(params)
+  
+  rep.params <- perfect_reporting()
+  
+  cur.g <- generate_graph(ex.params, cur.net)
+  
+  cur.r <- reporting_graph(rep.params, cur.g)
+  
+  return(cur.r)
+
+}
+
+sib.imperfect.reporting.agg <- function(cur.net, gp.vars, gps.in.H, tau) {
+ 
+  V(cur.net)$eligible  <- as.numeric(V(cur.net)$eligible)
+  V(cur.net)$all       <- 1
+  
+  # parameters for who to report 
+  params <- list(groups=c(gp.vars, 'all', 'eligible'),
+                 gps.in.F = 'eligible',
+                 gps.in.H = gps.in.H)
+  ex.params <- existing_params(params)
+  
+  # parameters for constructing reporting network
+  # from social network
+  rep.params <- imperfect_reporting(params=list(tau = tau,
+                                                eta = 1))
+  
+  # create the social network
+  cur.g <- generate_graph(ex.params, cur.net)
+  
+  # create the reporting network from the social network
+  cur.r <- reporting_graph(rep.params, cur.g)
+  
+  #tmp <- as_data_frame(cur.r, what='vertices')
+  #cat("sum is :", sum(tmp$y.agegp1Xsex1Xdied.past7yr), "\n")
+  
+  return(cur.r)
+
+}
+
+```
+
+Get censuses under perfect reporting
+
+```{r}
+tic("Creating census under perfect reporting")
+
+sib.perfect.r <- sib.perfect.reporting(pseudou.network, ivs)
+
+## census of the entire network
+## (used for computing truth, below)
+ego.census <- sample_graph(sib.perfect.r,  params=entire_census())
+
+## this is perfect reporting, so the reported connections are the truth;
+## also, this means reported connections and visibilities are both equal to degree
+## so we'll replace everything with degrees
+ego.census <- ego.census %>%
+  select(-starts_with('v.')) %>%
+  rename_(.dots=setNames(names(.), gsub("y\\.", "d.", names(.))))
+
+## determine whether or not each person is visible
+ego.census <- ego.census %>%
+              mutate(ego.visible = ifelse(d.eligible == 0, 0, 1),
+                     ego.visible.withself = ifelse(eligible + d.eligible == 0, 0, 1))
+
+## and join this info onto the sibling universe too
+pseudou.sibs <- pseudou.sibs %>% left_join(ego.census %>% select(id, ego.visible, ego.visible.withself), by='id')
+
+## census only of eligible respondents
+ego.frame.census <- sample_graph(sib.perfect.r,  params=frame_census())
+ego.frame.census <- ego.frame.census %>%
+  select(-starts_with('v.')) %>%
+  rename_(.dots=setNames(names(.), gsub("y\\.", "d.", names(.))))
+
+toc()
+```
+
+By this point, `ego.census` has a census of the entire network,
+and `ego.frame.census` has a census of the frame population.
+  
+# Simulate reporting scenarios
+
+Generate reporting networks with a bunch of different reporting vals,
+and create census datasets from these reporting networks.
+(Later, we'll simulate surveys based on these census datasets.)
+
+This takes about 4 minutes on the cluster
+
+```{r}
+tic("Generating reporting networks for the different reporting scenarios")
+
+set.seed(998877)
+
+tau.D.vals <- c(.8, 1)
+tau.N.vals <- c(.8, 1)
+
+sim.params <- expand.grid(tau.D = tau.D.vals,
+                          tau.N = tau.N.vals)
+sim.params$rep.idx <- 1:nrow(sim.params)
+
+if(parallel) {
+  plan(multiprocess, workers=num.cores)
+}
+
+rep.nets <- sim.params %>%
+  split(1:nrow(sim.params)) %>%
+  #map(function(pars) {
+  future_map(function(pars) {
+    
+    ## use aggregate-level imperfect reporting
+    ## to get a reporting network for reporting about deaths
+    cur.r.D <- sib.imperfect.reporting.agg(pseudou.network, 
+                                           gp.vars=ivs.D, 
+                                           gps.in.H=c('died.past7yr'),
+                                           tau=pars$tau.D)
+    
+    
+    ## use aggregate-level imperfect reporting
+    ## to get a reporting network for reporting about other quantities
+    ## (exposure and frame membership)
+    cur.r.N <- sib.imperfect.reporting.agg(pseudou.network, 
+                                           gp.vars=c(ivs.N, ivs.F, ivs.NxF), 
+                                           gps.in.H = c('exp', 'eligible'),
+                                           tau=pars$tau.N)
+        
+    
+    ## census only of eligible respondents
+    cur.r.D.census <- sample_graph(cur.r.D,  params=frame_census())
+    cur.r.N.census <- sample_graph(cur.r.N,  params=frame_census())
+    
+    ## put these together into one dataset
+    toadd <- setdiff(colnames(cur.r.N.census), colnames(cur.r.D.census))
+    
+    cur.r.census <- cur.r.D.census %>%
+      left_join(cur.r.N.census[,c('id', toadd)], 
+                by='id')
+    
+    cur.r.census$uber.tau.D <- pars$tau.D
+    cur.r.census$uber.tau.N <- pars$tau.N
+    
+    # join in the true degree info (which is helpful for evaluating estimators)
+    cur.r.census <- cur.r.census %>% 
+      left_join(ego.frame.census %>%
+                  select(id, starts_with("d.")),
+                by='id')
+    
+    cur.r.census$rep.idx <- pars$rep.idx
+    
+    return(cur.r.census)
+    
+  })
+
+if(parallel) {
+  plan(sequential)
+}
+toc()
+```
+
+```{r}
+## TEMPORARY SAVE TO SPEED DEVELOPMENT TIME
+#tic("Saving intermediate image")
+#save.image(here('sim-data', 'temp-checkpoint10-sib-simulated-surveys.RData'))
+#toc()
+
+#load(here('sim-data', 'temp-checkpoint10-sib-simulated-surveys.RData'))
+```
+
+
+TODO LEFT OFF HERE
+
+* figure out exactly why going from 0 to 1 fixed things
+* do we still need na.rm in fns below?
+* need adjustment factors including respondent
+* then finish writing simulation up
+* variance estimation
+* ... then figure out how to frame paper
+
+
+Estimators we'll study via simulation
+
+```{r}
+## the format of df will be
+##    caseid / ... / cell / y.died.past7yr / y.exp
+##
+## should return a dataframe with format
+##    cell / asdr.hat / tot.died.hat / tot.exp.hat / estimator
+## (estimator -> name of estimator)
+
+## aggregate estimator based on not including the respondent
+## in the reports
+estimator_agg <- function(df) {
+  
+  ## add design weights if they aren't already there
+  if (! 'design_weight' %in% names(df)) {
+    df$design_weight <- 1
+  }
+  
+  estimates <- df %>%
+    group_by(cell) %>%
+    summarise(tot.y.died = sum(design_weight * y.died.past7yr),
+              tot.y.exp  = sum(design_weight * y.exp)) %>%
+    mutate(asdr.hat = tot.y.died / tot.y.exp,
+           estimator = 'agg')
+  
+  return(estimates %>% select(cell, 
+                              asdr.hat, 
+                              tot.died.hat=tot.y.died, 
+                              tot.exp.hat = tot.y.exp,
+                              estimator))
+}
+
+## aggregate estimator based on including the respondent
+## in the reports
+estimator_agg_withR <- function(df) {
+  
+  ## add design weights if they aren't already there
+  if (! 'design_weight' %in% names(df)) {
+    df$design_weight <- 1
+  }
+  
+  estimates <- df %>%
+    mutate(y.prime.died.past7yr = y.died.past7yr,
+           # if R has exposure (i.e., ego.exp == 1), then add one to reported exposure
+           y.prime.exp = ego.exp + y.exp) %>%
+    group_by(cell) %>%
+    summarise(tot.y.died = sum(design_weight * y.prime.died.past7yr),
+              tot.y.exp  = sum(design_weight * y.prime.exp)) %>%
+    mutate(asdr.hat = tot.y.died / tot.y.exp,
+           estimator = 'agg_withR')
+  
+  return(estimates %>% select(cell, 
+                              asdr.hat, 
+                              tot.died.hat=tot.y.died,
+                              tot.exp.hat=tot.y.exp,
+                              estimator))
+}
+
+
+## estimator_ind is based on not including the respondent
+## in the reports
+estimator_ind <- function(df) {
+  
+  ## add design weights if they aren't already there
+  if (! 'design_weight' %in% names(df)) {
+    df$design_weight <- 1
+  }
+  
+  estimates <- df %>%
+    mutate(y.expXineligible = y.exp - y.expXeligible,
+           y.died.ind = (y.died.past7yr / (y.tot.eligible + 1)),
+           y.exp.ind1 = ifelse(y.tot.eligible > 0,
+                                (y.expXeligible / y.tot.eligible),
+                                0),
+           y.exp.ind2 = (y.expXineligible / (y.tot.eligible + 1)),
+           y.exp.ind = y.exp.ind1 + y.exp.ind2)    %>%
+    group_by(cell) %>%
+    summarise(tot.y.died = sum(design_weight * y.died.ind),
+              tot.y.exp  = sum(design_weight * y.exp.ind)) %>%
+    mutate(asdr.hat = tot.y.died / tot.y.exp,
+           estimator = 'ind')
+  
+  return(estimates %>% select(cell, 
+                              asdr.hat, 
+                              tot.died.hat=tot.y.died,
+                              tot.exp.hat=tot.y.exp,
+                              estimator))
+}
+
+## estimator_ind_withR is based on including the respondent
+## in the reports
+estimator_ind_withR <- function(df) {
+  
+  ## add design weights if they aren't already there
+  if (! 'design_weight' %in% names(df)) {
+    df$design_weight <- 1
+  }
+  
+  estimates <- df %>%
+    mutate(y.expXineligible = y.exp - y.expXeligible,
+           y.died.ind = (y.died.past7yr / (y.tot.eligible + 1)),
+           y.exp.ind  = (y.exp + ego.exp) / (y.tot.eligible + 1)) %>%
+    group_by(cell) %>%
+    summarise(tot.y.died = sum(design_weight * y.died.ind),
+              tot.y.exp  = sum(design_weight * y.exp.ind)) %>%
+    mutate(asdr.hat = tot.y.died / tot.y.exp,
+           estimator = 'ind_withR')
+  
+  return(estimates %>% select(cell, 
+                              asdr.hat, 
+                              tot.died.hat=tot.y.died,
+                              tot.exp.hat=tot.y.exp,
+                              estimator))
+}
+```
+
+# Simulate surveys
+
+Simulate surveys from the different reporting scenarios constructed above
+
+NB: this takes a long time to run... say 6 hours or so on a 2017 MBP
+(about 12 mins on cluster)
+
+```{r}
+# sampling fraction
+# (this is a fraction of the frame, not the universe)
+f.vals <- c(.05, .1, .15, .3, .6)
+
+# number of repetitions
+#M <- 3
+M <- 1000
+
+tic("Simulating surveys for each reporting scenario")
+set.seed(112233)
+
+if(parallel) {
+  plan(multiprocess, workers=num.cores)
+}
+
+# outer map: over censuses from reporting networks w/ different reporting params
+svy.sims <- future_map_dfr(rep.nets,
+#svy.sims <- map_df(rep.nets,
+           function(census) {
+             
+             
+            all.ids <- census$id
+            
+            census.long <- census %>%
+              ## this is needed to keep track of whether or not ego
+              ## contributed exposure in the given cell (for reports including respondent)
+              rename(!!!setNames(paste0(ivs.cells, "Xexp"),
+                              paste0('ego.',ivs.cells, "Xexp"))) %>% 
+              select(id, 
+                     universeid, 
+                     #caseid, 
+                     #gk.weight, 
+                     starts_with('tau'), 
+                     starts_with('gamma'),
+                     starts_with('eta'),
+                     paste0('ego.', ivs.cells, "Xexp"),
+                     'y.tot.eligible'='y.eligible',
+                     'd.tot.eligible'='d.eligible',
+                     paste0("y.", ivs.cells, "Xdied.past7yr"),
+                     paste0("y.", ivs.cells, "XexpXeligible"),
+                     paste0("y.", ivs.cells, "Xexp"),
+                     paste0("y.", ivs.cells, "Xeligible")
+                     ) %>%
+              gather(key=vname, 
+                     value=y, 
+                     matches("XexpXeligible|Xdied.past7yr|Xexp|Xeligible"))   %>%
+              extract(vname, 
+                      c("foo", "cell", "qty"), 
+                      paste0("(y\\.|ego\\.)(", paste0(ivs.cells, collapse="|"), ")(.*)")) %>%
+              #mutate(qty = paste0("y.", str_sub(qty, 2))) %>%
+              mutate(qty = paste0(foo, str_sub(qty, 2))) %>%
+              select(-foo) %>% 
+              spread(qty, y) 
+            
+              # map over the different sampling fractions (ie, sample sizes)
+              reps <- map(f.vals,
+                       function(sampling_frac) {
+                         
+                         # simulate M different surveys for each sample size
+                         cur.res <- map_df(1:M,
+                                           function(rep.idx) {
+                                             n <- floor(sampling_frac * length(all.ids))
+                                             
+                                             sampled.ids <- sample(all.ids, n, replace=FALSE)
+                                             
+                                             df <- census.long %>% filter(id %in% sampled.ids)
+                                             
+                                             df$design_weight <- length(all.ids)/n
+                                             
+                                             e1 <- estimator_agg(df)
+                                             e2 <- estimator_agg_withR(df)
+                                             e3 <- estimator_ind(df)
+                                             e4 <- estimator_ind_withR(df)
+                                             
+                                             ests <- bind_rows(e1, e2, e3, e4)
+                                             
+                                             ests$f <- sampling_frac
+                                             ests$m <- rep.idx
+                                             
+                                             ests$uber.tau.D <- census$uber.tau.D[1]
+                                             ests$uber.tau.N <- census$uber.tau.N[1]
+                                             
+                                             return(ests)
+                                             
+                                           })  
+                       })
+              
+              return(bind_rows(reps))
+})
+
+if(parallel) {
+  plan(sequential)
+}
+toc()
+```
+
+```{r}
+## TEMPORARY SAVE TO SPEED DEVELOPMENT TIME
+#tic("Saving intermediate image")
+#save.image(here('sim-data', 'temp-checkpoint20-sib-simulated-surveys.RData'))
+#toc()
+
+#load(here('sim-data', 'temp-checkpoint20-sib-simulated-surveys.RData'))
+```
+
+Calculate several different 'truths':
+
+* the visible death rate, or actually prop dead (when respondents are excluded from reports)
+* the visible death rate, or actually prop dead (when respondents are included in reports)
+* the invisible death rate, or actually prop dead (when respondents are excluded from reports)
+* the population death rate, or actually prop dead  
+* the factor C in the expression relating the visible death rates with and without including
+  the respondent in reports
+
+```{r}
+## the true visible death rate
+## (when respondents are NOT included in reports)
+visible_truth <- ego.census %>% 
+  filter(ego.visible == 1) %>%
+  select(id, died.past7yr, one_of(ivs.cells)) %>%
+  gather(key=cell, value=in_cell, one_of(ivs.cells))  %>%
+  filter(in_cell == 1)  %>%
+  select(-in_cell) %>%
+  group_by(cell) %>%
+  summarize(N.cell = n(),
+            D.cell = sum(died.past7yr),
+            asdr = mean(died.past7yr)) %>%
+  mutate(estimator='visible_truth')
+
+visible_truth
+```
+
+```{r}
+## the true visible death rate
+## (when respondents ARE included in reports)
+visible_truth_withr <- ego.census %>% 
+  filter(ego.visible.withself == 1) %>%
+  select(id, died.past7yr, one_of(ivs.cells)) %>%
+  gather(key=cell, value=in_cell, one_of(ivs.cells))  %>%
+  filter(in_cell == 1)  %>%
+  select(-in_cell) %>%
+  group_by(cell) %>%
+  summarize(N.cell = n(),
+            D.cell = sum(died.past7yr),
+            asdr = mean(died.past7yr)) %>%
+  mutate(estimator='visible_truth_withr')
+
+visible_truth_withr
+```
+
+```{r}
+## the true invisible death rate 
+## (when respondents are NOT included in reports)
+invisible_truth <- ego.census %>% 
+  filter(ego.visible != 1) %>%
+  select(id, died.past7yr, one_of(ivs.cells)) %>%
+  gather(key=cell, value=in_cell, one_of(ivs.cells))  %>%
+  filter(in_cell == 1)  %>%
+  select(-in_cell) %>%
+  group_by(cell) %>%
+  summarize(N.cell = n(),
+            D.cell = sum(died.past7yr),
+            asdr = mean(died.past7yr)) %>%
+  mutate(estimator='invisible_truth')
+
+invisible_truth
+```
+
+```{r}
+## the true aggregate death rate 
+truth <- ego.census %>% 
+  select(id, died.past7yr, one_of(ivs.cells)) %>%
+  gather(key=cell, value=in_cell, one_of(ivs.cells))  %>%
+  filter(in_cell == 1)  %>%
+  select(-in_cell) %>%
+  group_by(cell) %>%
+  summarize(N.cell = n(),
+            D.cell = sum(died.past7yr),
+            asdr = mean(died.past7yr)) %>%
+  mutate(estimator='truth')
+
+truth
+```
+
+```{r}
+## the factor C in the relationship between
+## visible death rates including respondent and
+## visible death rates not including respondent
+visinvis.C <- ego.census %>%
+  ## filter down to people who are (i) eligible, but (ii) have no eligible sibs
+  filter(eligible == 1, d.eligible == 0) %>%
+  select(id, one_of(ivs.cells)) %>%
+  gather(key=cell, value=in_cell, one_of(ivs.cells))  %>%
+  filter(in_cell == 1)  %>%
+  select(-in_cell) %>%
+  group_by(cell) %>%
+  summarize(C.cell = n())
+
+visinvis.C  
+```
+
+
+```{r}
+## TEMPORARY SAVE TO SPEED DEVELOPMENT TIME
+#tic("Saving intermediate image")
+#save.image(here('sim-data', 'temp-checkpoint30-sib-simulated-surveys.RData'))
+#toc()
+
+#load(here('sim-data', 'temp-checkpoint30-sib-simulated-surveys.RData'))
+```
+
+### Calculate the adjustment factors
+
+Remember: in this simulation, we assume there are no false positive reports anywhere
+
+#### Aggregate adjustment factors
+
+First, structural aggregate adjustment factors
+
+```{r}
+adj.factors.struct.agg <- 
+  ego.census %>%
+  ## this is for VISIBLE deaths
+  mutate(isvisible = as.numeric(d.eligible > 0)) %>%
+  filter(isvisible == 1) %>%
+  select(d.eligible, died.past7yr, one_of(ivs.cells)) %>%
+  gather(key=cell, value=in_cell, one_of(ivs.cells)) %>%
+  filter(in_cell == 1) %>%
+  select(-in_cell) %>%
+  group_by(cell) %>%
+  summarise(bar.n.f = mean(d.eligible),
+            bar.d.f = sum(died.past7yr*d.eligible)/sum(died.past7yr)) %>%
+  # this is the degree ratio for the aggregate estimator
+  mutate(agg.adj.factor.struct = bar.n.f / bar.d.f)
+
+## now the same thing, but including the respondent
+adj.factors.struct.agg.withR <- 
+  ego.census %>%
+  ## this is for VISIBLE deaths
+  filter(ego.visible.withself == 1) %>%
+  select(d.eligible, died.past7yr, one_of(ivs.cells), eligible) %>%
+  gather(key=cell, value=in_cell, one_of(ivs.cells)) %>%
+  filter(in_cell == 1) %>%
+  select(-in_cell) %>%
+  group_by(cell) %>%
+  summarise(## we add eligible to d.eligible here because this is the with-respondent estimator
+            ## and we assume eligible respondents include themselves in exposure reports
+            bar.n.f.prime = mean(d.eligible + eligible),
+            # we don't add 1 to d.eligible here because someone who dies does not survive
+            # to report herself
+            bar.d.f.prime = sum(died.past7yr*d.eligible)/sum(died.past7yr)) %>%
+  # this is the degree ratio for the aggregate estimator with respondent included in reports
+  mutate(agg.adj.factor.struct.withR = bar.n.f.prime / bar.d.f.prime)
+```
+
+Next, calculate reporting aggregate adjustment factors (these will vary by reporting network, 
+and will generally deviate slightly from the expected values specified in the simluation setup above)
+
+```{r}
+exp.vname <- 'exp'
+death.vname <- 'died.past7yr'
+
+res <- data.frame()
+  
+for (rn.idx in 1:length(rep.nets)) {
+  
+  this.rn <- rep.nets[[rn.idx]]
+  
+  for (cell in ivs.cells) {
+    
+    tau.deaths <- with(this.rn, 
+                       lazy_eval(~ sum(a) / sum(b), 
+                                 list(a=this.rn[[paste0('y.', cell, 'X', death.vname)]],
+                                      b=this.rn[[paste0('d.', cell, 'X', death.vname)]])))
+    
+    # people who died can't report, so R being included or not will not affect tau parameter for deaths
+    tauprime.deaths <- tau.deaths
+    
+    tau.exp <- with(this.rn, 
+                    lazy_eval(~ sum(a) / sum(b), 
+                              list(a=this.rn[[paste0('y.', cell, 'X', exp.vname)]],
+                                   b=this.rn[[paste0('d.', cell, 'X', exp.vname)]])))
+    
+    # assume respondents report accurately about themselves
+    tauprime.exp <- with(this.rn, 
+                         lazy_eval(~ sum(a + self) / sum(b + self), 
+                                   list(a=this.rn[[paste0('y.', cell, 'X', exp.vname)]],
+                                        b=this.rn[[paste0('d.', cell, 'X', exp.vname)]],
+                                        self=this.rn[[paste0(cell, 'X', exp.vname)]])))
+    
+    res <- bind_rows(res,
+                     list(rn.idx = rn.idx,
+                          cell=cell,
+                          tau.exp = tau.exp,
+                          tau.deaths = tau.deaths,
+                          tauprime.exp = tauprime.exp,
+                          tauprime.deaths = tauprime.deaths,
+                          ## NB: for now, assuming eta is 1 (no false positives)
+                          eta.exp = 1,
+                          eta.deaths = 1,
+                          etaprime.exp = 1,
+                          etaprime.deaths = 1))
+  }  
+}
+
+adj.factors.rep.agg <- res %>%
+  mutate(agg.adj.factor.rep = (eta.deaths / eta.exp) * (tau.exp / tau.deaths),
+         agg.adj.factor.rep.withR = (etaprime.deaths / etaprime.exp) * (tauprime.exp / tauprime.deaths))
+
+```
+
+Now combine the structural and reporting aggregate adjustment factors
+
+```{r}
+adj.factors.agg <- adj.factors.rep.agg %>% 
+  left_join(adj.factors.struct.agg, by='cell') %>%
+  mutate(adj.factor.agg = agg.adj.factor.rep * agg.adj.factor.struct,
+         adj.factor.agg.num = (eta.deaths / tau.deaths) * (1/bar.d.f),
+         adj.factor.agg.denom = (eta.exp / tau.exp) * (1/bar.n.f))
+
+
+adj.factors.agg.withR <- adj.factors.rep.agg %>% 
+  left_join(adj.factors.struct.agg.withR, by='cell') %>%
+  mutate(adj.factor.agg.withR = agg.adj.factor.rep.withR * agg.adj.factor.struct.withR,
+         adj.factor.agg.withR.num = (etaprime.deaths / tauprime.deaths) * (1/bar.d.f.prime),
+         adj.factor.agg.withR.denom = (etaprime.exp / tauprime.exp) * (1/bar.n.f.prime))
+```
+
+#### Individual adjustment factors
+
+```{r}
+#############################################
+## some helper functions
+## for finite-popn variance, covariance, etc
+fp.cov <- function(x,y) {
+    tmp <- (x-mean(x))*(y-mean(y))
+    return(mean(tmp))
+}
+
+fp.var <- function(x) {
+    return(var(x) * (length(x) - 1) / length(x))
+}
+
+fp.cv <- function(x) {
+  return(sqrt(fp.var(x)) / mean(x))
+}
+
+fp.cor <- function(x,y) {
+    tmp <- fp.cov(x,y) / (sqrt(fp.var(x)) * sqrt(fp.var(y)))
+    return(tmp)
+}
+
+mse.est <- function(ests, truth) {
+    epsilon <- ests - truth
+    return(mean(epsilon^2))
+}
+
+```
+
+```{r}
+#sim.params
+#rep.net.idx <- 2
+#cur.reporting.census <- rep.nets[[rep.net.idx]]
+#pseudou.sibs
+
+get_ind_adjustment_factors <- function(cur.reporting.census, pseudou.sibs) {
+  
+  ########
+  ## convert the census into a long dataset
+  ## in which each row is a sibship X cell
+  ## and the columns are the various reported quantities (d.exp, y.died.past7yr, etc...)
+  cur.r.census.long <- cur.reporting.census %>%
+                ## this is needed to keep track of whether or not ego
+                ## contributed exposure in the given cell (for reports including respondent)
+                rename(!!!setNames(paste0(ivs.cells, "Xexp"),            
+                                paste0('ego.',ivs.cells, "Xexp"))) %>%   
+                select(id, 
+                       ## universeid is the sibship id
+                       universeid, 
+                       starts_with('tau'), 
+                       starts_with('gamma'),
+                       starts_with('eta'),
+                       paste0('ego.', ivs.cells, "Xexp"), ## NEW
+                       ## NOTE:
+                       ## renaming these y.tot.eligible and d.tot.eligible to distinguish
+                       ## them. after this transformation is over,
+                       ##   y.eligible -> num reported eligible in the specific cell
+                       ##   y.tot.eligible -> num reported eligible across the whole sibship
+                       'y.tot.eligible'='y.eligible', 
+                       'd.tot.eligible'='d.eligible',
+                       paste0("y.", ivs.cells, "Xdied.past7yr"),
+                       paste0("y.", ivs.cells, "XexpXeligible"),
+                       paste0("y.", ivs.cells, "Xexp"),
+                       paste0("y.", ivs.cells, "Xeligible"),
+                       paste0("d.", ivs.cells, "Xdied.past7yr"),
+                       paste0("d.", ivs.cells, "XexpXeligible"),
+                       paste0("d.", ivs.cells, "Xexp"),
+                       paste0("d.", ivs.cells, "Xeligible")
+                       ) %>%
+                gather(key=vname, 
+                       value=val, 
+                       matches("(y|d|ego)(.*)XexpXeligible|Xdied.past7yr|Xexp|Xeligible"))  %>%
+                extract(vname, 
+                        c("foo", "cell", "qty"), 
+                        paste0("(y\\.|d\\.|ego\\.)(", paste0(ivs.cells, collapse="|"), ")(.*)"))  %>%
+                mutate(qty = paste0(foo, str_sub(qty, 2))) %>%
+                select(-foo)  %>%  
+                spread(qty, val) 
+  
+  ########
+  ## add individual-level reporting quantities to the
+  ## long dataset we just created
+  ## the result has a row for each person X cell
+  cur.r.census.ind.adj <- cur.r.census.long %>%
+    mutate(# to make the formulas a little clearer
+           y.expXineligible = y.exp - y.expXeligible,
+           d.expXineligible = d.exp - d.expXeligible,
+           # true positive params 
+           ind.tau.D = case_when(d.died.past7yr == 0 ~ NA_real_,
+                                 TRUE ~ y.died.past7yr / d.died.past7yr),
+           ind.tau.F = case_when(d.tot.eligible == 0 ~ NA_real_,
+                                 TRUE ~ y.tot.eligible / d.tot.eligible),
+           # we assume respondents are not dead (seems reasonable)
+           ind.tauprime.D = ind.tau.D,
+           # we assume respondents correctly include themselves in the eligible popn
+           ind.tauprime.F = (y.tot.eligible + 1) / (d.tot.eligible + 1),
+           ind.tau.N = case_when(d.exp == 0 ~ NA_real_,
+                                 TRUE ~ y.exp / d.exp),
+           ind.tau.NxF = case_when(d.expXeligible == 0 ~ NA_real_,
+                                   TRUE ~ y.expXeligible / d.expXeligible),
+           ind.tau.NxnotF = case_when(d.expXineligible == 0 ~ NA_real_,
+                                      TRUE ~ y.expXineligible / d.expXineligible),
+           # for reports including respondent
+           ind.tauprime.N = case_when((d.exp + ego.exp) == 0 ~ NA_real_,
+                                      TRUE ~ (y.exp + ego.exp) / (d.exp + ego.exp)),
+           ## no false positives, for now
+           ind.eta.N = 1,
+           ind.eta.NxF = 1,
+           ind.eta.NxnotF = 1,
+           ind.eta.F = 1,
+           ind.etaprime.F = 1,
+           ind.eta.D = 1,
+           ind.etaprime.D = 1,
+           ind.etaprime.N = 1,
+           ## now the net adjustment factors 
+           ## NB: switched defaults to 1
+           ind.gamma.D = (ind.etaprime.F / ind.eta.D) * 
+                         (ind.tau.D / ind.tauprime.F),
+           ind.gamma.NxF = (ind.eta.F / ind.eta.NxF) * 
+                           (ind.tau.NxF / ind.tau.F),
+           ind.gamma.NxnotF = (ind.etaprime.F / ind.eta.NxnotF) * 
+                              (ind.tau.NxnotF / ind.tauprime.F),
+           ind.gammaprime.D = (ind.etaprime.F / ind.etaprime.D) * 
+                              (ind.tauprime.D / ind.tauprime.F),
+           ind.gammaprime.N = (ind.etaprime.F / ind.etaprime.N) * 
+                              (ind.tauprime.N / ind.tauprime.F)
+           )
+  
+  
+  ########
+  ## calculate sibship-level quantities by aggregating the
+  ## individual quantities
+  ## the result has a row for each sibship X cell
+  cur.r.census.sibship.ind.adj <- cur.r.census.ind.adj %>%
+    group_by(universeid, cell) %>%
+    ## there will be NAs when people don't report any D or NxF or NxnotF; these
+    ## should be left out of calculating the gamma bar quantities
+    summarize(sib.gamma.bar.D = mean(ind.gamma.D, na.rm=TRUE),
+              sib.gamma.bar.NxF = mean(ind.gamma.NxF, na.rm=TRUE),
+              sib.gamma.bar.NxnotF = mean(ind.gamma.NxnotF, na.rm=TRUE),
+              sib.gammaprime.bar.D = mean(ind.gammaprime.D, na.rm=TRUE),
+              sib.gammaprime.bar.N = mean(ind.gammaprime.N, na.rm=TRUE)) %>%
+    ## cases where one of these quantities is NaN means that all sibs had
+    ## an NA value -- ie, none of them reported anything.
+    ## these should be 1 -- this was the source of a hard-to-find bug
+    mutate(sib.gamma.bar.D = case_when(is.nan(sib.gamma.bar.D) ~ 1,
+                                       TRUE ~ sib.gamma.bar.D),
+           sib.gammaprime.bar.D = case_when(is.nan(sib.gammaprime.bar.D) ~ 1,
+                                            TRUE ~ sib.gammaprime.bar.D),
+           sib.gammaprime.bar.N = case_when(is.nan(sib.gammaprime.bar.N) ~ 1,
+                                            TRUE ~ sib.gammaprime.bar.N),
+           sib.gamma.bar.NxF = case_when(is.na(sib.gamma.bar.NxF) ~ 1,
+                                         TRUE ~ sib.gamma.bar.NxF),
+           sib.gamma.bar.NxnotF = case_when(is.nan(sib.gamma.bar.NxnotF) ~ 1,
+                                            TRUE ~ sib.gamma.bar.NxnotF))
+           
+  ########
+  ## calculate p(F|N) for each sibship
+  ## p(F|N) = p.F.N = |\sigma \cap N^V_\alpha \cap F| / |\sigma \cap N^V_\alpha|
+  ## the result has one row for each sibship X cell
+  ##
+  ## NOTE: we need to restrict to only *visible* exposure; missing this caused a hard-to-find bug
+  cur.sibships.pFN <- pseudou.sibs %>%
+                  ## only want to calculate p.F.N for visible exposure
+                  filter(ego.visible == 1) %>%
+                  group_by(universeid) %>%
+                  mutate(tmpid=1:n()) %>%
+                  ungroup() %>%
+                  select(universeid, 
+                         tmpid,
+                         paste0(ivs.cells, "XexpXeligible"),
+                         paste0(ivs.cells, "Xexp"))  %>%
+                  gather(key=vname, 
+                         value=val, 
+                         matches("(.*)XexpXeligible|Xexp")) %>%
+                  extract(vname, 
+                          c("cell", "qty"), 
+                          paste0("(", paste0(ivs.cells, collapse="|"), ")(.*)")) %>%
+                  mutate(qty = paste0(str_sub(qty, 2))) %>%
+                  spread(qty, val) %>%
+                  group_by(universeid, cell) %>%
+                  ## p.F.N will be NA when the sibship/cell has 0 exposure
+                  ## this gets fixed after the join, below
+                  summarize(p.F.N = case_when(sum(exp) == 0 ~ 0,
+                                              TRUE ~ sum(expXeligible)/sum(exp))) 
+  
+  ## NOTE: for sensitivity to reports including the respondent, 
+  ##       a separate calculation would need to 
+  ## to the cur.sibships.pFN one above; that relies on respondents not being included
+  
+  ########
+  ## join p.F.N onto the sibship-level sibship reporting quantities
+  ## so that we can calculate \gamma^\star
+  ## (which is a p.F.N-weighted average of the individual-level reporting quantities)
+  ## the result has one row for each sibship X cell
+  cur.r.census.sibship.ind.adj <- cur.r.census.sibship.ind.adj %>%
+    left_join(cur.sibships.pFN, by=c('universeid', 'cell')) %>%
+    ## in cases where nobody in the sibship has any exposure, p.F.N is undefined;
+    ## we'll define p.F.N to be 0 in that case
+    ## (this makes no difference to the results, but makes the code simpler)
+    mutate(p.F.N = ifelse(is.na(p.F.N), 0, p.F.N)) %>%
+    mutate(sib.gamma.star.bar.N = (p.F.N * sib.gamma.bar.NxF) +
+                                  ((1-p.F.N) * sib.gamma.bar.NxnotF))
+  
+  ########
+  ## for each sibship, calculate the true number of deaths and the true amount of exposure
+  ## the result has one row for each sibship X cell 
+  cur.sibships.DandN <- pseudou.sibs %>%
+                  ## want visible deaths and visible exposure here
+                  filter(ego.visible==1) %>%
+                  group_by(universeid) %>%
+                  mutate(tmpid=1:n()) %>%
+                  ungroup() %>%
+                  select(universeid, 
+                         tmpid,
+                         paste0(ivs.cells, "Xdied.past7yr"),
+                         paste0(ivs.cells, "Xexp"))  %>%
+                  gather(key=vname, 
+                         value=val, 
+                         matches("(.*)Xexp|Xdied.past7yr"))  %>%
+                  extract(vname, 
+                          c("cell", "qty"), 
+                          paste0("(", paste0(ivs.cells, collapse="|"), ")(.*)"))  %>%
+                  mutate(qty = paste0(str_sub(qty, 2))) %>%
+                  spread(qty, val) %>%
+                  group_by(universeid, cell) %>%
+                  summarize(tot.D = sum(died.past7yr),
+                            tot.N = sum(exp)) 
+  
+  
+  ########
+  ## under reports including the individual,
+  ## for each sibship, calculate the true number of deaths and the true amount of exposure
+  ## the result has one row for each sibship X cell 
+  ## this is subtly different from the previous calculation, because the definition of the
+  ## visible population changes when respondents include themselves in reports
+  cur.sibships.DandNprime <- pseudou.sibs %>%
+                  ## want visible deaths and visible exposure here
+                  filter(ego.visible.withself==1) %>%
+                  group_by(universeid) %>%
+                  mutate(tmpid=1:n()) %>%
+                  ungroup() %>%
+                  select(universeid, 
+                         tmpid,
+                         paste0(ivs.cells, "Xdied.past7yr"),
+                         paste0(ivs.cells, "Xexp"))  %>%
+                  gather(key=vname, 
+                         value=val, 
+                         matches("(.*)Xexp|Xdied.past7yr"))  %>%
+                  extract(vname, 
+                          c("cell", "qty"), 
+                          paste0("(", paste0(ivs.cells, collapse="|"), ")(.*)"))  %>%
+                  mutate(qty = paste0(str_sub(qty, 2))) %>%
+                  spread(qty, val) %>%
+                  group_by(universeid, cell) %>%
+                  summarize(tot.D.prime = sum(died.past7yr),
+                            tot.N.prime = sum(exp))   
+  
+  ########
+  ## join sibship-level counts of deaths and exposures into cur.r.census.pop.ind.adj
+  ## the result has one row for each sibship X cell
+  cur.r.census.sibship.ind.adj <- cur.r.census.sibship.ind.adj %>%
+    left_join(cur.sibships.DandN, by=c('universeid', 'cell')) %>%
+    # sibships w/ NAs have no visible deaths / visible exposure
+    mutate(tot.D = ifelse(is.na(tot.D), 0, tot.D),
+           tot.N = ifelse(is.na(tot.N), 0, tot.N)) %>%
+    left_join(cur.sibships.DandNprime, by=c('universeid', 'cell')) %>%
+    # sibships w/ NAs have no visible deaths / visible exposure
+    mutate(tot.D.prime = ifelse(is.na(tot.D.prime), 0, tot.D.prime),
+           tot.N.prime = ifelse(is.na(tot.N.prime), 0, tot.N.prime))
+    
+  #tmpbkup <- cur.r.census.ind.adj
+  
+  ########
+  ## aggregate the individual-level adjustment factors up into
+  ## population-level adjustment factors (averaged across sibships)
+  cur.r.census.pop.ind.adj <- cur.r.census.sibship.ind.adj %>%
+    group_by(cell) %>%
+    summarize(num.sibships = n(),
+              pop.gamma.bar.D = mean(sib.gamma.bar.D),
+              pop.gamma.star.bar.N = mean(sib.gamma.star.bar.N),
+              pop.gammaprime.bar.D = mean(sib.gammaprime.bar.D),
+              pop.gammaprime.bar.N = mean(sib.gammaprime.bar.N),
+              pop.cor.D.gamma.D = fp.cor(tot.D, sib.gamma.bar.D),
+              pop.cor.N.gamma.star.N = fp.cor(tot.N, sib.gamma.star.bar.N),
+              pop.cor.Dprime.gammaprime.D = fp.cor(tot.D.prime, sib.gammaprime.bar.D),
+              pop.cor.Nprime.gammaprime.N = fp.cor(tot.N.prime, sib.gammaprime.bar.N),
+              pop.cv.D = fp.cv(tot.D),
+              pop.cv.N = fp.cv(tot.N),
+              pop.cv.Dprime = fp.cv(tot.D.prime),
+              pop.cv.Nprime = fp.cv(tot.N.prime),
+              pop.cv.gamma.D = fp.cv(sib.gamma.bar.D),
+              pop.cv.gamma.star.N = fp.cv(sib.gamma.star.bar.N),
+              pop.cv.gammaprime.D = fp.cv(sib.gammaprime.bar.D),
+              pop.cv.gammaprime.N = fp.cv(sib.gammaprime.bar.N),
+              ## if sib.gamma.bar.D or tot.D is a constant vector, the correlation
+              ## is undefined, but the K.D factor should be 0
+              ## (in the derivation, the K.D factor is really the covariance, which is defined;
+              ##  the easier-to-interpret expression with correaltion and cv is what needs non-zero
+              ##  variance to go through)
+              pop.K.D = ifelse(! is.nan(pop.cor.D.gamma.D),
+                               pop.cor.D.gamma.D * pop.cv.D * pop.cv.gamma.D,
+                               0),
+              pop.Kprime.D = ifelse(! is.nan(pop.cor.Dprime.gammaprime.D),
+                                    pop.cor.Dprime.gammaprime.D * pop.cv.Dprime * pop.cv.gammaprime.D,
+                                    0),
+              ## if sib.gamma.star.bar.N or tot.N is a constant vector, the correlation
+              ## is undefined, but the K.N factor should be 0
+              pop.K.N = ifelse(! is.nan(pop.cor.N.gamma.star.N),
+                               pop.cor.N.gamma.star.N * pop.cv.N * pop.cv.gamma.star.N,
+                               0),
+              pop.Kprime.N = ifelse(! is.nan(pop.cor.Nprime.gammaprime.N),
+                                    pop.cor.Nprime.gammaprime.N * pop.cv.Nprime * pop.cv.gammaprime.N,
+                                    0),
+              ## the adjustment factor is what you multiply the estimate by
+              ## to adjust it
+              adj.factor.ind.denom = 1 / (pop.gamma.star.bar.N * (1 + pop.K.N)),
+              adj.factor.ind.num   = 1 / (pop.gamma.bar.D * (1 + pop.K.D)),
+              adj.factor.ind.prime.denom = 1 / (pop.gammaprime.bar.N * (1 + pop.Kprime.N)),
+              adj.factor.ind.prime.num   = 1 / (pop.gammaprime.bar.D * (1 + pop.Kprime.D)),
+              ## this is equal to adj.factor.ind.num/adj.factor.ind.denom,
+              ## but it seems inefficient to multiply (1/x) / (1/y); it's more direct
+              ## to just calculate y/x
+              adj.factor.ind = (pop.gamma.star.bar.N / pop.gamma.bar.D) * 
+                               (1 + pop.K.N)/(1 + pop.K.D),
+              adj.factor.ind.withR = (pop.gammaprime.bar.N / pop.gammaprime.bar.D) * 
+                                     (1 + pop.Kprime.N)/(1 + pop.Kprime.D))
+  
+  return(list(summ=cur.r.census.pop.ind.adj, 
+              sibship=cur.r.census.sibship.ind.adj,
+              person=cur.r.census.ind.adj))
+
+}
+
+```
+
+This takes about 3 minutes on the cluster
+
+```{r}
+tic("Calculating individual adjustment factors")
+
+if(parallel) {
+  plan(multiprocess, workers=num.cores)
+}
+
+#adj.factors.ind <- map_df(1:length(rep.nets),
+adj.factors.ind <- future_map_dfr(1:length(rep.nets),
+           function(rep.net.idx) {
+             #rep.net.idx <- 4
+             census <- rep.nets[[rep.net.idx]]
+             iadj <- get_ind_adjustment_factors(census, pseudou.sibs)$summ 
+             #iadj <- get_ind_adjustment_factors(census, pseudou.sibs)
+             iadj$rn.idx <- rep.net.idx
+             return(iadj)
+           })
+
+if(parallel) {
+  plan(sequential)
+}
+
+toc()
+```
+
+
+### Calculate estimands -- ie, the estimators calculated on the census
+
+This takes about 2 minutes on the cluster
+
+```{r}
+tic("Calculating estimands")
+
+if(parallel) {
+  plan(multiprocess, workers=num.cores)
+}
+
+#estimand <- map_df(1:length(rep.nets),
+estimand <- future_map_dfr(1:length(rep.nets),
+           function(rep.net.idx) {
+             
+            census <- rep.nets[[rep.net.idx]]
+
+            all.ids <- 1:nrow(census)
+            census$id <- all.ids
+            
+            census.long <- census %>%
+              ## this is needed to keep track of whether or not ego
+              ## contributed exposure in the given cell (for reports including respondent)
+              rename(!!!setNames(paste0(ivs.cells, "Xexp"),
+                              paste0('ego.',ivs.cells, "Xexp"))) %>% 
+              select(id, 
+                     universeid, 
+                     #caseid, 
+                     #gk.weight, 
+                     starts_with('tau'), 
+                     starts_with('gamma'),
+                     starts_with('eta'),
+                     paste0('ego.', ivs.cells, "Xexp"),
+                     'y.tot.eligible'='y.eligible',
+                     'd.tot.eligible'='d.eligible',
+                     paste0("y.", ivs.cells, "Xdied.past7yr"),
+                     paste0("y.", ivs.cells, "XexpXeligible"),
+                     paste0("y.", ivs.cells, "Xexp"),
+                     paste0("y.", ivs.cells, "Xeligible")
+                     ) %>%
+              gather(key=vname, 
+                     value=y, 
+                     matches("XexpXeligible|Xdied.past7yr|Xexp|Xeligible"))   %>%
+              extract(vname, 
+                      c("foo", "cell", "qty"), 
+                      paste0("(y\\.|ego\\.)(", paste0(ivs.cells, collapse="|"), ")(.*)")) %>%
+              #mutate(qty = paste0("y.", str_sub(qty, 2))) %>%
+              mutate(qty = paste0(foo, str_sub(qty, 2))) %>%
+              select(-foo) %>% 
+              spread(qty, y) 
+            
+            estimand_agg <- estimator_agg(census.long) %>%
+              mutate(estimator = 'estimand_agg') %>%
+              rename(asdr=asdr.hat)
+            
+            estimand_agg_withR <- estimator_agg_withR(census.long) %>%
+              mutate(estimator = 'estimand_agg_withR') %>%
+              rename(asdr=asdr.hat)
+            
+            estimand_ind <- estimator_ind(census.long) %>%
+              mutate(estimator = 'estimand_ind') %>%
+              rename(asdr=asdr.hat)
+            
+            estimand_ind_withR <- estimator_ind_withR(census.long) %>%
+              mutate(estimator = 'estimand_ind_withR') %>%
+              rename(asdr=asdr.hat)
+            
+            ## adjust aggregate estimand w/ aggregate adjustment factors
+            estimand_agg_adj <- estimand_agg %>%
+              ## join in adjustment factors
+              left_join(adj.factors.agg %>%
+                          filter(rn.idx == rep.net.idx) %>%
+                          select(cell, adj.factor.agg, adj.factor.agg.num, adj.factor.agg.denom),
+                        by='cell') %>%
+              mutate(estimator = 'estimand_agg_adj',
+                     tot.died.hat = tot.died.hat * adj.factor.agg.num,
+                     tot.exp.hat = tot.exp.hat * adj.factor.agg.denom,
+                     asdr = asdr * adj.factor.agg)   %>%
+              select(-adj.factor.agg, -adj.factor.agg.num, -adj.factor.agg.denom)
+            
+            ## adjust aggregate estimand w/ R with aggregate with R adjustment factors
+            estimand_agg_withR_adj <- estimand_agg_withR %>%
+              ## join in adjustment factors
+              left_join(adj.factors.agg.withR %>%
+                          filter(rn.idx == rep.net.idx) %>%
+                          select(cell, 
+                                 adj.factor.agg.withR, 
+                                 adj.factor.agg.withR.num, 
+                                 adj.factor.agg.withR.denom),
+                        by='cell') %>%
+              mutate(estimator = 'estimand_agg_withR_adj',
+                     tot.died.hat = tot.died.hat * adj.factor.agg.withR.num,
+                     tot.exp.hat = tot.exp.hat * adj.factor.agg.withR.denom,
+                     asdr = asdr * adj.factor.agg.withR)   %>%
+              select(-adj.factor.agg.withR, -adj.factor.agg.withR.num, -adj.factor.agg.withR.denom)
+            
+             ## adjust individual estimand w/ individual adjustment factors
+             estimand_ind_adj <- estimand_ind %>%
+               left_join(adj.factors.ind %>%
+                           filter(rn.idx == rep.net.idx) %>%
+                           select(cell, 
+                                  adj.factor.ind, adj.factor.ind.num, adj.factor.ind.denom),
+                         by='cell') %>%
+              mutate(estimator = 'estimand_ind_adj',
+                     asdr = asdr * adj.factor.ind,
+                     tot.died.hat = tot.died.hat * adj.factor.ind.num,
+                     tot.exp.hat = tot.exp.hat * adj.factor.ind.denom) %>%
+                     #asdr = asdr / adj.factor.ind) %>%
+              select(-adj.factor.ind, -adj.factor.ind.num, -adj.factor.ind.denom)
+             
+             ## adjust individual with R estimand w/ individual with R adjustment factors
+             estimand_ind_withR_adj <- estimand_ind_withR %>%
+               left_join(adj.factors.ind %>%
+                           filter(rn.idx == rep.net.idx) %>%
+                           select(cell, 
+                                  adj.factor.ind.withR, adj.factor.ind.prime.num, adj.factor.ind.prime.denom),
+                         by='cell') %>%
+              mutate(estimator = 'estimand_ind_withR_adj',
+                     asdr = asdr * adj.factor.ind.withR,
+                     tot.died.hat = tot.died.hat * adj.factor.ind.prime.num,
+                     tot.exp.hat = tot.exp.hat * adj.factor.ind.prime.denom) %>%
+                     #asdr = asdr / adj.factor.ind) %>%
+              select(-adj.factor.ind.withR, -adj.factor.ind.prime.num, -adj.factor.ind.prime.denom)
+            
+            out <- bind_rows(estimand_agg, 
+                             estimand_ind,
+                             estimand_agg_withR,
+                             estimand_ind_withR,
+                             estimand_agg_adj,
+                             estimand_ind_adj,
+                             estimand_agg_withR_adj,
+                             estimand_ind_withR_adj)
+            out$uber.tau.D <- census$uber.tau.D[1]
+            out$uber.tau.N <- census$uber.tau.N[1]
+            
+            return(out)
+           })
+
+if(parallel) {
+  plan(sequential)
+}
+
+toc()
+```
+
+Put together datasets w/ reference quantities to compare the estimators to
+(i.e., the true values, estimands, etc).
+
+```{r}
+all.truths <- bind_rows(visible_truth, visible_truth_withr, invisible_truth, truth) %>%
+  rename(quantity=estimator)
+
+all.estimands <- estimand %>%
+  rename(estimand=estimator)
+```
+
+Save what we've done so far; we'll summarize the results in another file,
+`04_simulation_results.Rmd`.
+
+```{r}
+tic("Saving results")
+save.image(here('sim-data', 'sib-simulated-surveys.RData'))
+toc()
+```
+
+```{r}
+toc()
+```
+

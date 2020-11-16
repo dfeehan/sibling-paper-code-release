@@ -1,0 +1,49 @@
+Type: Compendium
+Package: Sibling survival methods paper
+Title: What the Package Does (One Line, Title Case)
+Version: 0.0.1
+Authors@R: 
+    person(given = "First",
+           family = "Last",
+           role = c("aut", "cre"),
+           email = "first.last@example.com")
+Description: Code to accompany paper on estimating adult
+    death rates from sibling histories
+License: What license it uses
+Depends: 
+    dplyr,
+    forcats,
+    furrr,
+    future,
+    ggplot2,
+    glue,
+    haven,
+    here,
+    igraph,
+    kableExtra,
+    knitr,
+    latex2exp,
+    lazyeval,
+    leaflet,
+    lubridate,
+    mapview,
+    networkreporting,
+    nrsimulatr,
+    rdhs,
+    rmarkdown,
+    scales,
+    sf,
+    siblingsurvival,
+    stringr,
+    surveybootstrap,
+    tictoc,
+    tidyverse,
+    wpp2017
+Remotes: 
+    dfeehan/networkreporting,
+    dfeehan/nrsimulatr,
+    dfeehan/siblingsurvival,
+    dfeehan/surveybootstrap,
+    haozhu233/kableExtra
+Encoding: UTF-8
+LazyData: true

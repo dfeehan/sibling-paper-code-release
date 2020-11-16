@@ -1,0 +1,298 @@
+---
+title: "Get data for sibling paper"
+output: html_notebook
+---
+
+This file uses `rdhs` and the DHS API to
+
+* get some aggregate characteristics of DHS surveys
+* download the Malawi 2000 DHS data, which we'll use later
+
+## Get some aggregate characteristics of DHS surveys
+
+```{r}
+library(tidyverse)
+library(siblingsurvival)
+library(rdhs)
+library(tictoc)
+library(lubridate)
+library(glue)
+library(here)
+library(wpp2017)
+
+## these are optional - used to make a map
+library(sf)
+library(leaflet)
+library(mapview)
+```
+
+
+Following the [rdhs vignette](https://cran.r-project.org/web/packages/rdhs/vignettes/introduction.html):
+
+```{r}
+set_rdhs_config(email = 'feehan@berkeley.edu', # you'll need your own account
+                global=FALSE,
+                project = "Sibling history example", # you'll need your own DHS-approved project
+                cache_path = "./rdhs_cache",
+                config_path = "rdhs.json"
+                )
+```
+
+According to [the DHS API reference](https://api.dhsprogram.com/rest/dhs/surveycharacteristics/DHS), the maternal mortality module is survey characteristic 1.
+
+
+```{r}
+sc <- dhs_survey_characteristics()
+
+# maternal mortality is SurveyCharacteristicID 1
+
+ids <- dhs_countries(returnFields=c("CountryName", "DHS_CountryCode"))
+
+survs <- dhs_surveys(surveyCharacteristicIds = 1) %>% left_join(dhs_countries())
+
+survs.agg <- survs %>%
+  rename(A3 = ISO3_CountryCode) %>%
+  group_by(A3) %>%
+  summarize(num_siblinghistory = n())
+
+```
+
+Some numbers - how many surveys, what time range, how many countries
+
+```{r}
+survs <- survs %>% mutate(year = year(ymd(FieldworkEnd)))
+
+num.survs <- nrow(survs)
+num.countries <- length(unique(survs$DHS_CountryCode))
+mean.n <- mean(survs$NumberOfWomen)
+min.year <- min(survs$year)
+max.year <- max(survs$year)
+
+glue("
+    There are:
+        {num.survs} surveys in
+        {num.countries} countries
+    that have included the sibling history module.
+
+    Sibling history data have been collected from {min.year} to {max.year}.
+
+    The average number of women interviewed is {format(round(mean.n,0),big.mark=',')}.
+
+")
+```
+
+
+Look at the distribution of sample sizes for the Women's Questionnaire
+
+```{r}
+
+ggplot(survs) + 
+  geom_histogram(aes(x=NumberOfWomen)) + 
+  geom_vline(aes(xintercept=mean.n), color='red') +
+  ggtitle(glue::glue("
+Number of women interviewed
+in DHS surveys with sibling history module
+(Mean: {format(round(mean.n,0),big.mark=',')})
+")) +
+  theme_minimal()
+```
+
+```{r}
+num.surveys <- nrow(survs)
+num.countries <- length(unique(survs$ISO3_CountryCode))
+
+glue::glue("The DHS sibling history module has been collected in {num.surveys} surveys in {num.countries} countries.")
+```
+
+
+Plot the availability of data by subregion
+
+```{r}
+survs.region <- survs %>%
+  mutate(SubregionName = str_replace_all(SubregionName, " ", "\n"),
+        subregion = fct_infreq(SubregionName)) %>%
+  group_by(subregion) %>%
+  summarize(tot = n()) 
+
+sh.region <- ggplot(survs.region, aes(x=subregion, y=tot)) +
+  geom_col() +
+  xlab("") +
+  ylab("Number of surveys\nwith sibling history data") +
+  theme_minimal(base_size=14) +
+  theme(text=element_text(size=20))
+
+ggsave(filename=here('out', 'sh_byregion.pdf'),
+       height=6, width=12,
+       plot=sh.region)
+
+sh.region
+```
+
+Plot the availability of data by year
+
+```{r}
+survs.year <- survs %>%
+  mutate(year = str_sub(ReleaseDate, 1, 4)) %>%
+  mutate(year_gp = cut(as.numeric(year), 
+                       breaks=seq(from=1985, to=2020, by=5),
+                       labels=paste(c("1985-\n1989", "1990-\n1994", "1995-\n1999", "2000-\n2004",
+                                       "2005-\n2009", "2010-\n2014", "2015-\n2020"))))  %>%
+  filter(! is.na(year_gp)) %>%
+  group_by(year_gp) %>%
+  summarize(tot = n()) 
+
+sh.year <- ggplot(survs.year, aes(x=year_gp, y=tot)) +
+  geom_col() +
+  #xlab("Sub-region") +
+  xlab("") +
+  ylab("Number of surveys\nwith sibling history data") +
+  theme_minimal(base_size=16) +
+  theme(text=element_text(size=22))
+
+ggsave(filename=here('out', 'sh_byyear.pdf'),
+       height=6, width=9,
+       plot=sh.year)
+
+sh.year
+```
+
+Make a map
+
+This geojson file downloaded from [geo-maps](https://github.com/simonepri/geo-maps/blob/master/info/countries-land.md):
+
+```{r}
+gjfn <- "countries-land-5km.geo.json"
+countries <- sf::st_read(here('data', gjfn))
+```
+
+```{r}
+c2 <- countries %>% 
+  left_join(survs.agg) %>%
+  mutate(num_siblinghistory = ifelse(is.na(num_siblinghistory),
+                                     0,
+                                     num_siblinghistory))
+```
+
+```{r}
+#pal <- colorNumeric("viridis", NULL)
+pal <- colorBin("YlOrRd", domain = c2$num_siblinghistory)
+
+m <- leaflet(c2) %>%
+  addTiles() %>%
+  addPolygons(stroke = FALSE, smoothFactor = 0.3, fillOpacity = 1,
+    fillColor = ~pal(num_siblinghistory),
+    label = ~paste0(A3, ": ", formatC(num_siblinghistory, big.mark = ","))) %>%
+  setView(0,0, zoom=2) %>%
+  addLegend(pal = pal, values = ~num_siblinghistory, opacity = 1.0,
+            position="bottomright")
+
+mapshot(m, file=here('out', "sh_count.png"))
+
+m
+```
+
+
+## Get the data from the Malawi 2000 DHS
+
+Using the `rdhs` package, download the Malawi 2000 survey.
+
+We want the Malawi 2000 DHS
+
+```{r}
+svy_ids <- dhs_surveys(surveyYear=c(2000), 
+                       surveyType="DHS",
+                       countryIds=c("MW") # the country code for Malawi
+                       )
+```
+
+```{r}
+mw2000_fn <- dhs_datasets(surveyIds = 'MW2000DHS',
+                          fileFormat = "FL")
+mw2000_ir_fn <- mw2000_fn %>% filter(FileType=='Individual Recode') %>% pull(FileName)
+```
+
+Download the actual dataset
+
+```{r}
+downloads <- get_datasets(dataset_filenames=c(mw2000_ir_fn))
+```
+
+```{r}
+mw2000 <- readRDS(downloads$MWIR41FL)
+```
+
+# prep the sibling histories
+
+```{r}
+prepped <- prep_dhs_sib_histories(mw2000,
+                                  # NB: default varmap is sibhist_varmap_dhs6
+                                  keep_missing = FALSE,
+                                  keep_varmap_only = TRUE)
+
+mw.ego <- prepped$ego.dat
+mw.sib <- prepped$sib.dat
+```
+
+Here's the respondent (ego) data
+
+```{r}
+mw.ego
+```
+
+And here's the sibling data
+
+```{r}
+mw.sib
+```
+
+Let's add an indicator for whether or not each sib is in the frame population
+
+```{r}
+mw.sib <- mw.sib %>% 
+  mutate(in.F = as.numeric((sib.alive==1) & (sib.age >= 15) & (sib.age <= 49) & (sib.sex == 'f')))
+```
+
+```{r}
+with(mw.sib, table(in.F, useNA='ifany'))
+```
+
+```{r}
+mw.sib <- mw.sib %>% filter(! is.na(in.F)) 
+```
+
+For the simulation study, we'll need a weight that is scaled to the size of the frame population.
+
+```{r}
+## get Malawi estimated popn in 2000 (the survey year)
+## this comes from the wpp2017 package, i.e., UNPD estimates
+data(popF)
+malawi.N.F <- popF %>%
+  filter(name=='Malawi') %>%
+  filter(age %in% c('15-19', '20-24', '25-29', '30-34', '35-39',
+                    '40-45', '45-49', '50-54', '55-59', '60-64')) %>%
+  pull(`2000`) %>%
+  sum()
+malawi.N.F <- malawi.N.F * 1e3
+
+# scale factor to convert relative to absolute weights
+malawi.sf <- malawi.N.F / sum(mw.ego$wwgt)
+
+mw.ego <- mw.ego %>%
+  mutate(scaledweight = wwgt * malawi.sf)
+
+mw.sib <- mw.sib %>%
+  mutate(scaledweight = wwgt * malawi.sf)
+```
+
+
+```{r}
+save(mw.ego,
+     mw.sib,
+     file=here('data', 'malawi_dhs_2000.RData'))
+```
+
+
+
+
+
+
