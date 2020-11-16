@@ -1,12 +1,12 @@
 Type: Compendium
 Package: Sibling survival methods paper
-Title: What the Package Does (One Line, Title Case)
+Title: Replication code for "Estimating adult death rates from sibling histories: A network approach"
 Version: 0.0.1
 Authors@R: 
-    person(given = "First",
-           family = "Last",
+    person(given = "Dennis",
+           family = "Feehan",
            role = c("aut", "cre"),
-           email = "first.last@example.com")
+           email = "feehan@berkeley.edu")
 Description: Code to accompany paper on estimating adult
     death rates from sibling histories
 License: What license it uses
@@ -40,10 +40,10 @@ Depends:
     tidyverse,
     wpp2017
 Remotes: 
-    dfeehan/networkreporting,
-    dfeehan/nrsimulatr,
-    dfeehan/siblingsurvival,
-    dfeehan/surveybootstrap,
-    haozhu233/kableExtra
+    dfeehan/networkreporting@cc86e0aa1421f98fa5cb5fbc52431e34db701817,
+    dfeehan/nrsimulatr@48f4599e6d2a4228db4f817b394a8f3e2b604121,
+    dfeehan/siblingsurvival@5a23c07dfdd67f46ced617cc1c210a08ef4682ae,
+    dfeehan/surveybootstrap@9ba432cc076b115271e9e890f1699e1af2aaf79d,
+    haozhu233/kableExtra@72a911b45b0660f89c3cc57cb6ad1bab030105fa    
 Encoding: UTF-8
 LazyData: true
