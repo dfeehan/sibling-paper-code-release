@@ -41,7 +41,7 @@ Depends:
     wpp2017
 Remotes: 
     dfeehan/networkreporting@cc86e0aa1421f98fa5cb5fbc52431e34db701817,
-    dfeehan/nrsimulatr@48f4599e6d2a4228db4f817b394a8f3e2b604121,
+    dfeehan/nrsimulatr@f539c54676c22034894bef9113543671bcfb795a,
     dfeehan/siblingsurvival@5a23c07dfdd67f46ced617cc1c210a08ef4682ae,
     dfeehan/surveybootstrap@9ba432cc076b115271e9e890f1699e1af2aaf79d,
     haozhu233/kableExtra@72a911b45b0660f89c3cc57cb6ad1bab030105fa    
