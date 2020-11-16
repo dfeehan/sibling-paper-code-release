@@ -3,9 +3,8 @@ LABEL maintainer='Dennis M. Feehan'
 USER root
 COPY . ${HOME}
 RUN chown -R ${NB_USER} ${HOME}
-#USER ${NB_USER}
 
-
+USER ${NB_USER}
 
 RUN wget https://github.com/dfeehan/sibling-paper-code-release/raw/main/DESCRIPTION && R -e "options(repos = list(CRAN = 'http://mran.revolutionanalytics.com/snapshot/2020-11-16/')); devtools::install_deps()"
 
