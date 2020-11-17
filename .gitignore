@@ -9,6 +9,7 @@ model_dhs_data.*
 rdhs.json
 rdhs_cache/
 *.swp
+*.nb.html
 server-sync.sh
 data/
 sim-data/
