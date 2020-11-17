@@ -20,6 +20,8 @@ library(latex2exp)
 library(glue)
 
 library(here)
+
+tic("Analyzing simulation results")
 ```
 
 Load the results of the simulation
@@ -506,6 +508,9 @@ plots.mse.exclr
 
 
 
+```{r}
+toc()
+```
 
 
 

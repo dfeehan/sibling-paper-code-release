@@ -8,6 +8,11 @@ This file uses `rdhs` and the DHS API to
 * get some aggregate characteristics of DHS surveys
 * download the Malawi 2000 DHS data, which we'll use later
 
+Note that you need a DHS account to download the Malawi dataset.
+Please look at the code that downloads the file, below, and
+change it to use your email address and the name of the project you
+registered with DHS.
+
 ## Get some aggregate characteristics of DHS surveys
 
 ```{r}
@@ -26,6 +31,17 @@ library(leaflet)
 library(mapview)
 ```
 
+
+Create some directories
+
+```{r}
+dir.create(file.path(here(), 'data'), showWarnings = FALSE)
+dir.create(file.path(here(), 'out'), showWarnings = FALSE)
+dir.create(file.path(here(), 'sim-data'), showWarnings = FALSE)
+dir.create(file.path(here(), 'sim-out'), showWarnings = FALSE)
+```
+
+**This next chunk is what you should customize to use your DHS account**
 
 Following the [rdhs vignette](https://cran.r-project.org/web/packages/rdhs/vignettes/introduction.html):
 
@@ -162,7 +178,7 @@ This geojson file downloaded from [geo-maps](https://github.com/simonepri/geo-ma
 
 ```{r}
 gjfn <- "countries-land-5km.geo.json"
-countries <- sf::st_read(here('data', gjfn))
+countries <- sf::st_read(here(gjfn))
 ```
 
 ```{r}

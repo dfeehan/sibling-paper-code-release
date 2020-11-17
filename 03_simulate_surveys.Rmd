@@ -3,44 +3,21 @@ title: "Sibling simulation study"
 output: html_notebook
 ---
 
+NOTE: this file takes about 30 minutes to run on a 2020 Macbook Pro with 8 cores.
+
 # Setup
 
-TODO:
-
-* add different parameterization for invisible deaths; 
-this could be done at the stage where respondents w/ no sibs
-  get added to sibling universe. Obviously, the respondents are all alive -- we need corresponding
-  dead respondents
-* think about actual simulation study that will show up in the paper
-  
-DESIGN CONSIDERATIONS
-* be sure that the sib universe is separated from the rest of the study, so that different
-  universes can be adopted
-* think about best way to handle individual-level reporting; very hard to do at invidiual level - maybe best way is to remove edges in aggregate and look at what the realized empirical quantities are for each individual after doing so
-  
-
-
 ```{r}
-## TODO - this is sensitive to the order in which the libraries are opened
-## due at least in part to dhstools, which imports plyr
-## TODO: to fix this, dhstools and other packages should just call plyr::whatever, i think
-#library(dhstools)
-
 library(wpp2017)
 library(surveybootstrap)
 library(networkreporting)
 
-#library(devtools); load_all("~/Dropbox/library/nrsimulatr/")
-# install this package using:
-#install_github('dfeehan/nrsimulatr')
 library(nrsimulatr)
 
 # igraph maskss some tidyverse functions, so load it first
 # (to give preference to tidyverse fns)
 library(igraph)
 
-#library(plyr); 
-#library(dplyr)
 library(tidyverse)
 library(forcats)
 library(haven)
@@ -64,6 +41,19 @@ if(parallel) {
   ## https://github.com/HenrikBengtsson/future/issues/185
   options(future.globals.maxSize = 768 * 1024^2)
 }
+```
+
+Some parameters
+
+```{r}
+## the number of sibships to resample from the DHS data
+#target.num.sibships <- 5000
+target.num.sibships <- 20000
+
+## number of repetitions for each combination of simulation parameters
+#M <- 3
+M <- 1000
+
 ```
 
 ```{r}
@@ -282,8 +272,8 @@ obs.sibs <- obs.sibs %>%
          died.past7yr = ifelse(lived.past7yr == 0, 0, died.past7yr)) %>%
   ## sibs are dead if either they died in the past 7 years, 
   ## or if they didn't live in the past 7 years
-  mutate(alive = case_when(died.past7yr == 1 ~ 0,
-                           lived.past7yr == 0 ~ 0,
+  mutate(alive = case_when(died.past7yr == 1 ~ 0L,
+                           lived.past7yr == 0 ~ 0L,
                            TRUE ~ as.integer(alive)))
 
 #with(obs.sibs %>% filter(lived.past7yr == 1), table(died.past7yr))
@@ -325,8 +315,7 @@ Now resample from the DHS data to get a population universe of sibships
 set.seed(100)
 
 ## the number of sibships to resample from the DHS data
-#target.num.siblings <- 5000
-target.num.sibships <- 20000
+# (this is now set at the top of the file)
 
 ## varying the size here controls the eventual size of the universe of siblings
 ## that we end up with
@@ -352,7 +341,7 @@ pseudou.sibships <-
   group_by(caseid) %>%
   mutate(universeid = paste0(caseid, '.', 1:n()))
 
-pseudou.sibships
+pseudou.sibships %>% slice_head(n=100)
 ```
 
 Add the characteristics of the sibships to the resampled population
@@ -629,7 +618,8 @@ pseudou.sibs <- pseudou.sibs %>% left_join(ego.census %>% select(id, ego.visible
 ego.frame.census <- sample_graph(sib.perfect.r,  params=frame_census())
 ego.frame.census <- ego.frame.census %>%
   select(-starts_with('v.')) %>%
-  rename_(.dots=setNames(names(.), gsub("y\\.", "d.", names(.))))
+  #rename_(.dots=setNames(names(.), gsub("y\\.", "d.", names(.))))
+  rename(!!!setNames(names(.), gsub("y\\.", "d.", names(.))))
 
 toc()
 ```
@@ -707,32 +697,14 @@ rep.nets <- sim.params %>%
     
     return(cur.r.census)
     
-  })
+  },
+  .options = future_options(seed=TRUE))
 
 if(parallel) {
   plan(sequential)
 }
 toc()
 ```
-
-```{r}
-## TEMPORARY SAVE TO SPEED DEVELOPMENT TIME
-#tic("Saving intermediate image")
-#save.image(here('sim-data', 'temp-checkpoint10-sib-simulated-surveys.RData'))
-#toc()
-
-#load(here('sim-data', 'temp-checkpoint10-sib-simulated-surveys.RData'))
-```
-
-
-TODO LEFT OFF HERE
-
-* figure out exactly why going from 0 to 1 fixed things
-* do we still need na.rm in fns below?
-* need adjustment factors including respondent
-* then finish writing simulation up
-* variance estimation
-* ... then figure out how to frame paper
 
 
 Estimators we'll study via simulation
@@ -757,7 +729,8 @@ estimator_agg <- function(df) {
   estimates <- df %>%
     group_by(cell) %>%
     summarise(tot.y.died = sum(design_weight * y.died.past7yr),
-              tot.y.exp  = sum(design_weight * y.exp)) %>%
+              tot.y.exp  = sum(design_weight * y.exp),
+              .groups='drop') %>%
     mutate(asdr.hat = tot.y.died / tot.y.exp,
            estimator = 'agg')
   
@@ -783,7 +756,8 @@ estimator_agg_withR <- function(df) {
            y.prime.exp = ego.exp + y.exp) %>%
     group_by(cell) %>%
     summarise(tot.y.died = sum(design_weight * y.prime.died.past7yr),
-              tot.y.exp  = sum(design_weight * y.prime.exp)) %>%
+              tot.y.exp  = sum(design_weight * y.prime.exp),
+              .groups='drop') %>%
     mutate(asdr.hat = tot.y.died / tot.y.exp,
            estimator = 'agg_withR')
   
@@ -814,7 +788,8 @@ estimator_ind <- function(df) {
            y.exp.ind = y.exp.ind1 + y.exp.ind2)    %>%
     group_by(cell) %>%
     summarise(tot.y.died = sum(design_weight * y.died.ind),
-              tot.y.exp  = sum(design_weight * y.exp.ind)) %>%
+              tot.y.exp  = sum(design_weight * y.exp.ind),
+              .groups='drop') %>%
     mutate(asdr.hat = tot.y.died / tot.y.exp,
            estimator = 'ind')
   
@@ -840,7 +815,8 @@ estimator_ind_withR <- function(df) {
            y.exp.ind  = (y.exp + ego.exp) / (y.tot.eligible + 1)) %>%
     group_by(cell) %>%
     summarise(tot.y.died = sum(design_weight * y.died.ind),
-              tot.y.exp  = sum(design_weight * y.exp.ind)) %>%
+              tot.y.exp  = sum(design_weight * y.exp.ind),
+              .groups='drop') %>%
     mutate(asdr.hat = tot.y.died / tot.y.exp,
            estimator = 'ind_withR')
   
@@ -864,9 +840,8 @@ NB: this takes a long time to run... say 6 hours or so on a 2017 MBP
 # (this is a fraction of the frame, not the universe)
 f.vals <- c(.05, .1, .15, .3, .6)
 
-# number of repetitions
-#M <- 3
-M <- 1000
+## M: number of repetitions for each combination of parameters
+# (now set at the top of the file)
 
 tic("Simulating surveys for each reporting scenario")
 set.seed(112233)
@@ -948,21 +923,13 @@ svy.sims <- future_map_dfr(rep.nets,
                        })
               
               return(bind_rows(reps))
-})
+  },
+  .options = future_options(seed=TRUE))
 
 if(parallel) {
   plan(sequential)
 }
 toc()
-```
-
-```{r}
-## TEMPORARY SAVE TO SPEED DEVELOPMENT TIME
-#tic("Saving intermediate image")
-#save.image(here('sim-data', 'temp-checkpoint20-sib-simulated-surveys.RData'))
-#toc()
-
-#load(here('sim-data', 'temp-checkpoint20-sib-simulated-surveys.RData'))
 ```
 
 Calculate several different 'truths':
@@ -1060,17 +1027,6 @@ visinvis.C <- ego.census %>%
 
 visinvis.C  
 ```
-
-
-```{r}
-## TEMPORARY SAVE TO SPEED DEVELOPMENT TIME
-#tic("Saving intermediate image")
-#save.image(here('sim-data', 'temp-checkpoint30-sib-simulated-surveys.RData'))
-#toc()
-
-#load(here('sim-data', 'temp-checkpoint30-sib-simulated-surveys.RData'))
-```
-
 ### Calculate the adjustment factors
 
 Remember: in this simulation, we assume there are no false positive reports anywhere
@@ -1091,7 +1047,8 @@ adj.factors.struct.agg <-
   select(-in_cell) %>%
   group_by(cell) %>%
   summarise(bar.n.f = mean(d.eligible),
-            bar.d.f = sum(died.past7yr*d.eligible)/sum(died.past7yr)) %>%
+            bar.d.f = sum(died.past7yr*d.eligible)/sum(died.past7yr),
+            .group='drop') %>%
   # this is the degree ratio for the aggregate estimator
   mutate(agg.adj.factor.struct = bar.n.f / bar.d.f)
 
@@ -1110,7 +1067,8 @@ adj.factors.struct.agg.withR <-
             bar.n.f.prime = mean(d.eligible + eligible),
             # we don't add 1 to d.eligible here because someone who dies does not survive
             # to report herself
-            bar.d.f.prime = sum(died.past7yr*d.eligible)/sum(died.past7yr)) %>%
+            bar.d.f.prime = sum(died.past7yr*d.eligible)/sum(died.past7yr),
+            .groups='drop') %>%
   # this is the degree ratio for the aggregate estimator with respondent included in reports
   mutate(agg.adj.factor.struct.withR = bar.n.f.prime / bar.d.f.prime)
 ```
@@ -1331,7 +1289,8 @@ get_ind_adjustment_factors <- function(cur.reporting.census, pseudou.sibs) {
               sib.gamma.bar.NxF = mean(ind.gamma.NxF, na.rm=TRUE),
               sib.gamma.bar.NxnotF = mean(ind.gamma.NxnotF, na.rm=TRUE),
               sib.gammaprime.bar.D = mean(ind.gammaprime.D, na.rm=TRUE),
-              sib.gammaprime.bar.N = mean(ind.gammaprime.N, na.rm=TRUE)) %>%
+              sib.gammaprime.bar.N = mean(ind.gammaprime.N, na.rm=TRUE),
+              .groups='drop') %>%
     ## cases where one of these quantities is NaN means that all sibs had
     ## an NA value -- ie, none of them reported anything.
     ## these should be 1 -- this was the source of a hard-to-find bug
@@ -1374,7 +1333,8 @@ get_ind_adjustment_factors <- function(cur.reporting.census, pseudou.sibs) {
                   ## p.F.N will be NA when the sibship/cell has 0 exposure
                   ## this gets fixed after the join, below
                   summarize(p.F.N = case_when(sum(exp) == 0 ~ 0,
-                                              TRUE ~ sum(expXeligible)/sum(exp))) 
+                                              TRUE ~ sum(expXeligible)/sum(exp)),
+                            .groups='drop') 
   
   ## NOTE: for sensitivity to reports including the respondent, 
   ##       a separate calculation would need to 
@@ -1417,7 +1377,8 @@ get_ind_adjustment_factors <- function(cur.reporting.census, pseudou.sibs) {
                   spread(qty, val) %>%
                   group_by(universeid, cell) %>%
                   summarize(tot.D = sum(died.past7yr),
-                            tot.N = sum(exp)) 
+                            tot.N = sum(exp),
+                            .groups='drop') 
   
   
   ########
@@ -1446,7 +1407,8 @@ get_ind_adjustment_factors <- function(cur.reporting.census, pseudou.sibs) {
                   spread(qty, val) %>%
                   group_by(universeid, cell) %>%
                   summarize(tot.D.prime = sum(died.past7yr),
-                            tot.N.prime = sum(exp))   
+                            tot.N.prime = sum(exp),
+                            .groups='drop')   
   
   ########
   ## join sibship-level counts of deaths and exposures into cur.r.census.pop.ind.adj
@@ -1516,7 +1478,8 @@ get_ind_adjustment_factors <- function(cur.reporting.census, pseudou.sibs) {
               adj.factor.ind = (pop.gamma.star.bar.N / pop.gamma.bar.D) * 
                                (1 + pop.K.N)/(1 + pop.K.D),
               adj.factor.ind.withR = (pop.gammaprime.bar.N / pop.gammaprime.bar.D) * 
-                                     (1 + pop.Kprime.N)/(1 + pop.Kprime.D))
+                                     (1 + pop.Kprime.N)/(1 + pop.Kprime.D),
+              .groups='drop')
   
   return(list(summ=cur.r.census.pop.ind.adj, 
               sibship=cur.r.census.sibship.ind.adj,

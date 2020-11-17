@@ -15,6 +15,8 @@ library(glue)
 library(here)
 library(latex2exp)
 library(kableExtra)
+
+tic("Malawi analysis")
 ```
 
 Load the data prepped in `01_get_data.Rmd`
@@ -894,11 +896,7 @@ ggsave(filename=here('out', 'invis-sens-pN.pdf'),
 invis.sens.pN
 ```
 
-
-
-## Save results
-
 ```{r}
-save.image(here('out', 'temp_malawi_2000_example.RData'))
+toc()
 ```
 
