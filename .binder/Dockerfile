@@ -1,6 +1,8 @@
 FROM rocker/binder:4.0.2
 LABEL maintainer='Dennis M. Feehan'
 
+ARG NB_USER=rstudio
+
 USER root
 COPY . ${HOME}
 
